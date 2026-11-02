@@ -11,7 +11,7 @@ import { PrivateKey, ProtoWallet } from '@bsv/sdk';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SITE = resolve(process.env.SITE_DIR || join(here, '../../bdrivex-site'));
-const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api } = await import(join(SITE, 'js/bdx-client.js'));
+const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api, saveKeyWrap, unwrapKey } = await import(join(SITE, 'js/bdx-client.js'));
 
 const PORT = 8799, BASE = `http://127.0.0.1:${PORT}`, ORIGIN = 'http://127.0.0.1:5173';
 const wallet = new ProtoWallet(PrivateKey.fromRandom());
@@ -177,6 +177,24 @@ ok(put.status === 201, 'PUT /v1/blobs/:sha256 stores a small blob');
 await rejects(api(BASE, T2).call('PUT', `/v1/blobs/${'1'.repeat(64)}`, { body: photo }), /^422/, 'PUT with a body that does not match its hash is refused');
 const back = Buffer.from(await (await api(BASE, T2).call('GET', `/v1/blobs/${ph}`, { headers: { range: 'bytes=100-199' } })).arrayBuffer());
 ok(back.equals(photo.subarray(100, 200)), 'GET /v1/blobs/:sha256 serves Range reads to the owner');
+
+// ---- v1.1: the file key wrapped by the owner's wallet, kept beside the file
+console.log('wallet-wrapped keys');
+const wrapOf = async (t = T2) => (await api(BASE, t).get('/v1/files')).files.find((f) => f.hash === up.hash)?.keyWrap;
+ok((await wrapOf()) === null, 'a file starts with no wrapped key');
+await saveKeyWrap({ base: BASE, token: T2, wallet, hash: up.hash, key: up.key });
+const wrap = await wrapOf();
+ok(typeof wrap === 'string' && !wrap.includes(up.key), 'PUT /v1/files/:sha256/key keeps the wrap, and it is not the key');
+ok((await unwrapKey(wallet, up.hash, wrap)) === up.key, 'the same wallet unwraps the same key (another device, same wallet)');
+await rejects(unwrapKey(stranger, up.hash, wrap), /./, 'another wallet cannot unwrap it');
+await rejects(unwrapKey(wallet, ph, wrap), /./, 'the wrap is bound to its file (key ID = hash)');
+const pub = await api(BASE).get(`/v1/s/${short.id}`);
+ok(!('keyWrap' in pub) && !JSON.stringify(pub).includes(wrap), 'a share link never shows the wrap');
+await rejects(api(BASE, st.token).call('PUT', `/v1/files/${up.hash}/key`, { json: { keyWrap: 'AAAA' } }), /^404/, 'nobody else can set a wrap on your file');
+await rejects(api(BASE, T2).call('PUT', `/v1/files/${up.hash}/key`, { json: { keyWrap: 'not base64url!' } }), /^400/, 'a wrap must be base64url');
+await rejects(api(BASE, T2).call('PUT', `/v1/files/${up.hash}/key`, { json: { keyWrap: 'A'.repeat(1025) } }), /^400/, 'and 1 KB at most');
+await api(BASE, T2).call('PUT', `/v1/files/${up.hash}/key`, { json: { keyWrap: null } });
+ok((await wrapOf()) === null, 'null clears it');
 
 await api(BASE, T2).del(`/v1/files/${up.hash}`);
 ok(!existsSync(blob), 'deleting a file removes its blob');

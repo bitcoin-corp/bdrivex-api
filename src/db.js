@@ -27,6 +27,8 @@ export function openDb(file) {
     CREATE TABLE IF NOT EXISTS reports (
       link_id TEXT PRIMARY KEY, at INTEGER NOT NULL, reason TEXT, ip TEXT);
   `);
+  // v1.1: the file key wrapped by the owner's wallet (BRC-2, counterparty self). Only that wallet can open it.
+  if (!db.prepare('PRAGMA table_info(files)').all().some((c) => c.name === 'key_wrap')) db.exec('ALTER TABLE files ADD COLUMN key_wrap TEXT');
   const q = (sql) => db.prepare(sql);
   return {
     db,
@@ -49,6 +51,7 @@ export function openDb(file) {
       mine: q('SELECT * FROM files WHERE owner = ? ORDER BY created_at DESC'),
       del: q('DELETE FROM files WHERE owner = ? AND hash = ?'),
       refs: q('SELECT COUNT(*) AS n FROM files WHERE hash = ?'),
+      wrap: q('UPDATE files SET key_wrap = ? WHERE owner = ? AND hash = ?'),
     },
     links: {
       add: q('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'),

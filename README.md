@@ -41,7 +41,8 @@ Tokens last 7 days and carry `aud` (the origin they were signed for: a request w
 | DELETE | `/v1/uploads/:id` | yes | | 204 |
 | PUT | `/v1/blobs/:sha256` | yes | body (at most 64 MB), optional `X-Bdx-Meta` | 201 `{hash, size}`; 422 on mismatch |
 | GET/HEAD | `/v1/blobs/:sha256` | yes (owner) | `Range` ok | ciphertext |
-| GET | `/v1/files` | yes | | `{files: [{hash, size, meta, createdAt, links: [{id, createdAt, expiresAt, revokedAt, downloads, reported}]}], usage}` |
+| GET | `/v1/files` | yes | | `{files: [{hash, size, meta, keyWrap, createdAt, links: [{id, createdAt, expiresAt, revokedAt, downloads, reported}]}], usage}` |
+| PUT | `/v1/files/:sha256/key` | yes (owner) | `{keyWrap}` base64url, at most 1 KB; `null` clears | 204 |
 | DELETE | `/v1/files/:sha256` | yes | | 204; its links go too, and the blob if nobody else holds it |
 | POST | `/v1/links` | yes | `{hash, ttl?}` seconds, default and max 30 days | 201 `{id, createdAt, expiresAt}` |
 | DELETE | `/v1/links/:id` | yes | | 204, switched off |
@@ -67,6 +68,17 @@ Defined in `bdrivex-site/js/bdx-crypto.js`, with the client in `js/bdx-client.js
 - Each segment is sealed with AES-256-GCM. IV = prefix | u32 big-endian segment index | 1 for the last segment, else 0. AAD = the header.
 - `meta` = base64url(header | AES-GCM of `{name, type, size}` JSON, padded to 256 bytes), with IV = prefix | ffffffff | 2.
 - One random 256-bit key per file. The share link is `https://bdrivex.com/s/<linkId>#k=<base64url key>`.
+
+## Wallet-wrapped file keys (v1.1)
+
+So the owner can open their files from any device, the site asks the owner's wallet to wrap each file key to itself
+and stores the wrap with `PUT /v1/files/:sha256/key`. It comes back only to the owner, in `GET /v1/files`, and never
+appears on a share link.
+
+- `keyWrap` = base64url of `wallet.encrypt({ plaintext: key (32 bytes), protocolID: [1, 'bdrivex file key'], keyID: <file sha256>, counterparty: 'self' })` (BRC-2).
+- Open it with `wallet.decrypt` and the same arguments. Security level 1, so a wallet asks once per site, not once per file.
+- `wrapKey`, `unwrapKey` and `saveKeyWrap` in `bdrivex-site/js/bdx-client.js` do this with any BRC-100 wallet.
+- Like everything else here, the wrap is opaque to the server: only the owner's wallet can open it.
 
 ## Licence
 

@@ -13,7 +13,8 @@
 //   DELETE /v1/uploads/:id
 //   PUT    /v1/blobs/:sha256       body = small blob (bPhotosX)         -> { hash, size }
 //   GET    /v1/blobs/:sha256                                            -> the blob, owner only, Range ok
-//   GET    /v1/files                                                    -> { files: [...links], usage }
+//   GET    /v1/files                                                    -> { files: [...links, keyWrap], usage }
+//   PUT    /v1/files/:sha256/key   { keyWrap }  (null clears)           -> 204, owner only, never shown on links
 //   DELETE /v1/files/:sha256
 //   POST   /v1/links               { hash, ttl }  (seconds, default and max 30 days) -> { id, expiresAt }
 //   DELETE /v1/links/:id                                                -> revoke
@@ -371,10 +372,21 @@ const linkView = (l) => ({ id: l.id, createdAt: l.created_at, expiresAt: l.expir
 
 route('GET', /^\/v1\/files$/, async (req, owner) => {
   const files = S.files.mine.all(owner).map((f) => ({
-    hash: f.hash, size: f.size, meta: f.meta, createdAt: f.created_at,
+    hash: f.hash, size: f.size, meta: f.meta, keyWrap: f.key_wrap ?? null, createdAt: f.created_at,
     links: S.links.forFile.all(owner, f.hash).map(linkView),
   }));
   return [200, { files, usage: usage(owner) }];
+}, { auth: true });
+
+// The file key wrapped by the owner's own wallet, so any device signed in to that wallet can open its files.
+// Opaque here like everything else; it goes back only to the owner, in GET /v1/files.
+route('PUT', /^\/v1\/files\/([0-9a-f]{64})\/key$/, async (req, owner, [hash]) => {
+  limit(req, 'key', 1200, 3600_000, owner, 600);
+  const { keyWrap } = await readJson(req);
+  if (keyWrap != null && (typeof keyWrap !== 'string' || keyWrap.length < 1 || keyWrap.length > 1024 || !/^[A-Za-z0-9_-]+$/.test(keyWrap))) fail(400, 'keyWrap must be base64url, 1 KB at most.');
+  if (!S.files.get.get(owner, hash)) fail(404, 'No such file.');
+  S.files.wrap.run(keyWrap ?? null, owner, hash);
+  return [204, null];
 }, { auth: true });
 
 route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
