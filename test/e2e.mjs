@@ -11,7 +11,10 @@ import { PrivateKey, ProtoWallet } from '@bsv/sdk';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SITE = resolve(process.env.SITE_DIR || join(here, '../../bdrivex-site'));
-const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api, saveKeyWrap, unwrapKey } = await import(join(SITE, 'js/bdx-client.js'));
+const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api, saveKeyWrap, unwrapKey, makeLink, openBoundLink, linkInfo, wrapForRecipient, unwrapFromSender } = await import(join(SITE, 'js/bdx-client.js'));
+const { newSeal, sealSegment, sealMeta, importKey, b64u } = await import(join(SITE, 'js/bdx-crypto.js'));
+const { parseRecipient } = await import(join(SITE, 'js/paymail.js'));
+const { DatabaseSync } = await import('node:sqlite');
 
 const PORT = 8799, BASE = `http://127.0.0.1:${PORT}`, ORIGIN = 'http://127.0.0.1:5173';
 const wallet = new ProtoWallet(PrivateKey.fromRandom());
@@ -201,22 +204,202 @@ ok(!existsSync(blob), 'deleting a file removes its blob');
 await rejects(openLink({ base: BASE, id: short.id, key: up.key }), /^404/, 'and its links');
 ok(readdirSync(join(data, 'tmp')).length === 1, 'only the unfinished test upload is left in tmp');
 
-// ---- invite-only mode: a second server that admits only the test wallet
+// ---- invite-only mode: a second server that admits only the test wallet (and a second invited wallet, O2)
+const startServer = async (port, dir, extra = {}) => {
+  const p = spawn(process.execPath, [join(here, '../src/server.js')], {
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATA_DIR: dir, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ...extra },
+    stdio: ['ignore', 'ignore', 'inherit'],
+  });
+  for (let i = 0; ; i++) { try { await fetch(`http://127.0.0.1:${port}/health`); break; } catch { if (i > 50) throw new Error(`server on ${port} did not start`); await new Promise((r) => setTimeout(r, 100)); } }
+  return p;
+};
 {
   const P2 = 8798, B2 = `http://127.0.0.1:${P2}`, d2 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
-  const s2 = spawn(process.execPath, [join(here, '../src/server.js')], {
-    env: { ...process.env, NODE_ENV: 'production', PORT: String(P2), DATA_DIR: d2, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ALLOWED_KEYS: identityKey },
-    stdio: 'ignore',
-  });
-  for (let i = 0; ; i++) { try { await fetch(B2 + '/health'); break; } catch { if (i > 50) throw new Error('server 2 did not start'); await new Promise((r) => setTimeout(r, 100)); } }
+  const o2 = new ProtoWallet(PrivateKey.fromRandom()), o2k = (await o2.getPublicKey({ identityKey: true })).publicKey;
+  const s2 = await startServer(P2, d2, { ALLOWED_KEYS: `${identityKey},${o2k}` });
   const sign = async (w, k) => {
     const c = await (await fetch(B2 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k }) })).json();
     const { signature } = await w.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
     return fetch(B2 + '/v1/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k, nonce: c.nonce, signature: Array.from(signature) }) });
   };
-  ok((await sign(wallet, identityKey)).status === 200, 'production defaults to invite-only: an invited wallet signs in');
+  const ownerRes = await sign(wallet, identityKey);
+  ok(ownerRes.status === 200, 'production defaults to invite-only: an invited wallet signs in');
   ok((await sign(stranger, sk)).status === 403, 'and a wallet not on the list is refused');
+
+  // ---- v1.2: send to one person
+  console.log('send to one person (v1.2)');
+  const OT = (await ownerRes.json()).token;
+  const O2T = (await (await sign(o2, o2k)).json()).token;
+  const rw = new ProtoWallet(PrivateKey.fromRandom()), rk = (await rw.getPublicKey({ identityKey: true })).publicKey; // recipient, not invited
+  const xw = new ProtoWallet(PrivateKey.fromRandom()), xk = (await xw.getPublicKey({ identityKey: true })).publicKey; // a third wallet, not invited
+  ok((await sign(rw, rk)).status === 403, 'before anything is sent to it, a wallet that is not invited cannot sign in');
+
+  const body = randomBytes(3 * 2 ** 20 + 777);
+  const up2 = await uploadFile({ base: B2, token: OT, source: { size: body.length, read: async (a, b) => new Uint8Array(body.subarray(a, b)) }, name: 'for-jon.bin', type: 'application/octet-stream' });
+  const bl = await makeLink({ base: B2, token: OT, site: 'https://bdrivex.com', hash: up2.hash, key: up2.key, ttl: 7 * 86400, recipient: rk, recipientLabel: '$jon', wallet });
+  ok(bl.bound && bl.url === `https://bdrivex.com/s/${bl.id}` && !bl.url.includes('#'), `a link sent to one person has no key in it: ${bl.url.replace(bl.id, '…')}`);
+
+  // input validation on POST /v1/links and PUT /v1/links/:id/recipient
+  const O = api(B2, OT);
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: 'zz' + rk.slice(2) }), /^400.*identity key/, 'recipient must be an identity key (hex)');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: '04' + rk.slice(2) }), /^400/, 'recipient must start 02 or 03');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: rk + '00' }), /^400/, 'recipient must be 66 characters');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipientWrap: 'AAAA' }), /^400/, 'a wrap needs a recipient');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: rk, recipientWrap: 'not base64url!' }), /^400/, 'recipientWrap must be base64url');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: rk, recipientWrap: 'A'.repeat(1025) }), /^400/, 'and 1 KB at most');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: rk, recipientLabel: '<script>' }), /^400/, 'recipientLabel must be a $handle or paymail');
+  await rejects(O.post('/v1/links', { hash: up2.hash, recipient: rk, senderKey: xk }), /^400/, 'senderKey can only be your own key');
+  await rejects(api(B2, O2T).call('PUT', `/v1/links/${bl.id}/recipient`, { json: { recipient: rk, recipientWrap: 'AAAA' } }), /^404/, 'nobody else can rebind your link');
+  await rejects(O.call('PUT', `/v1/links/${bl.id}/recipient`, { json: { recipient: xk, recipientWrap: 'AAAA' } }), /^409/, 'a link\'s recipient can\'t be changed');
+  await rejects(O.call('PUT', `/v1/links/${bl.id}/recipient`, { json: { recipient: rk } }), /^400/, 'PUT needs the wrap');
+
+  // what other people see
+  const anon = await linkInfo({ base: B2, id: bl.id });
+  const anonJson = JSON.stringify(anon);
+  ok(anon.bound && anon.forYou === false && anon.to === null && anon.from === identityKey && anon.size === up2.size, 'anyone else sees only: bound, who sent it, size, dates');
+  ok(!('meta' in anon) && !('recipientWrap' in anon) && !('hash' in anon) && !anonJson.includes(rk) && !anonJson.includes('$jon'), 'no meta, no wrap, no hash, nothing about the recipient');
+  const blobAs = (t, headers = {}) => fetch(`${B2}/v1/s/${bl.id}/blob`, { headers: { ...(t ? { authorization: `Bearer ${t}` } : {}), ...headers } });
+  let r = await blobAs(null);
+  ok(r.status === 403 && /someone else/.test((await r.json()).error), 'the blob is refused to an anonymous user (403, sent to someone else)');
+  ok((await fetch(`${B2}/v1/s/${bl.id}/blob`, { method: 'HEAD' })).status === 403, 'HEAD too');
+  await rejects(openLink({ base: B2, id: bl.id, key: up2.key }), /^403/, 'even with the file key, the anyone-link path refuses a bound link');
+  const asOwner = await linkInfo({ base: B2, id: bl.id, token: OT });
+  ok(asOwner.forYou === false && !('recipientWrap' in asOwner) && !('meta' in asOwner), 'the owner reading the share link gets the public view');
+  ok((await blobAs(OT)).status === 403, 'the owner cannot download as the recipient');
+  ok((await O.call('GET', `/v1/blobs/${up2.hash}`)).status === 200, 'the owner keeps owner access through the owner routes');
+  ok((await blobAs(O2T)).status === 403, 'a different signed-in (invited) wallet is refused');
+  ok((await sign(xw, xk)).status === 403, 'a third wallet that is not invited still cannot sign in');
+  const rep2 = await fetch(`${B2}/v1/s/${bl.id}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'grief' }) });
+  ok(rep2.status === 403, 'only the recipient can report (and switch off) a bound link');
+
+  // the owner's list: who it's for, never the wrap
+  const ownerFiles = await O.get('/v1/files');
+  const ol = ownerFiles.files.find((f) => f.hash === up2.hash).links.find((l) => l.id === bl.id);
+  ok(ol.bound && ol.recipient === rk && ol.recipientLabel === '$jon' && ol.ready && !JSON.stringify(ownerFiles).includes('recipientWrap'), 'the owner sees who it\'s for ($jon) and that it\'s ready, not the wrap');
+
+  // the recipient: a recipient-only session
+  const rRes = await sign(rw, rk);
+  const rs = await rRes.json();
+  ok(rRes.status === 200 && rs.scope === 'recipient' && rs.expiresAt - Date.now() <= 24 * 3600e3 + 5e3, 'a non-invited recipient can sign in while a link exists for it: scope recipient, 1 day');
+  const RT = rs.token, R = api(B2, RT);
+  await rejects(R.get('/v1/files'), /^403/, 'a recipient session cannot list files');
+  await rejects(R.get('/v1/me'), /^403/, 'or see an account');
+  await rejects(R.post('/v1/uploads', { size: 64 }), /^403/, 'or upload');
+  await rejects(R.call('PUT', `/v1/blobs/${ph}`, { body: photo }), /^403/, 'or PUT a blob');
+  await rejects(R.call('GET', `/v1/blobs/${up2.hash}`), /^403/, 'or read the owner\'s blob by hash');
+  await rejects(R.post('/v1/links', { hash: up2.hash }), /^403/, 'or make links');
+  await rejects(R.del(`/v1/files/${up2.hash}`), /^403/, 'or delete the owner\'s file');
+  await rejects(R.del(`/v1/links/${bl.id}`), /^403/, 'or switch off the owner\'s link');
+  const mine2 = await linkInfo({ base: B2, id: bl.id, token: RT });
+  ok(mine2.forYou && mine2.hash === up2.hash && mine2.senderKey === identityKey && typeof mine2.recipientWrap === 'string' && mine2.meta, 'signed in as the recipient: hash, meta, wrap and sender key');
+  ok(!mine2.recipientWrap.includes(up2.key) && !JSON.stringify(mine2).includes(up2.key), 'the wrap is not the key');
+  const opened2 = await openBoundLink({ base: B2, id: bl.id, token: RT, wallet: rw });
+  ok(opened2.meta.name === 'for-jon.bin', 'the recipient\'s wallet unwraps the key and reads the name');
+  const ps2 = [];
+  const got3 = await downloadLink({ base: B2, id: bl.id, link: opened2, sink: { write: (u8) => { ps2.push(u8); } } });
+  ok(got3.sha256 === sha(body) && Buffer.concat(ps2).equals(body), 'the recipient downloads and decrypts it, sha256 matches');
+  await rejects(unwrapFromSender(xw, { hash: up2.hash, linkId: bl.id, wrap: mine2.recipientWrap, senderKey: identityKey }), /./, 'a third wallet cannot unwrap the wrap');
+  await rejects(unwrapFromSender(rw, { hash: up2.hash, linkId: 'A'.repeat(22), wrap: mine2.recipientWrap, senderKey: identityKey }), /./, 'the wrap is bound to its link (key ID = hash.linkId)');
+  await rejects(unwrapFromSender(rw, { hash: up2.hash, linkId: bl.id, wrap: mine2.recipientWrap, senderKey: o2k }), /./, 'and to its sender');
+  const crossSite2 = await fetch(`${B2}/v1/s/${bl.id}/blob`, { headers: { authorization: `Bearer ${RT}`, origin: 'https://evil.example' } });
+  ok(crossSite2.status === 403, 'the recipient token from another site counts as no sign-in');
+
+  // a recipient session reads only links addressed to it
+  const forX = await makeLink({ base: B2, token: OT, site: 'https://bdrivex.com', hash: up2.hash, key: up2.key, recipient: xk, wallet });
+  const xi = await linkInfo({ base: B2, id: forX.id, token: RT });
+  ok(xi.forYou === false && !('recipientWrap' in xi) && !('meta' in xi), 'a recipient session gets only the public view of someone else\'s link');
+  ok((await fetch(`${B2}/v1/s/${forX.id}/blob`, { headers: { authorization: `Bearer ${RT}` } })).status === 403, 'and cannot download it');
+  await O.del(`/v1/links/${forX.id}`);
+
+  // a wrap that isn't in place yet: the recipient is told to wait
+  const half = await O.post('/v1/links', { hash: up2.hash, recipient: rk });
+  await rejects(linkInfo({ base: B2, id: half.id, token: RT }), /^409/, 'a link whose wrap isn\'t in place yet asks the recipient to wait');
+  await O.del(`/v1/links/${half.id}`);
+
+  // anyone-links and v1.1 still work on the same server
+  const anyL = await makeLink({ base: B2, token: OT, site: 'https://bdrivex.com', hash: up2.hash, key: up2.key });
+  ok(/#k=/.test(anyL.url) && !anyL.bound, 'an anyone-link still carries #k');
+  const ai = await openLink({ base: B2, id: anyL.id, key: parseShare(new URL(anyL.url).hash) });
+  const ps3 = [];
+  ok((await downloadLink({ base: B2, id: anyL.id, link: ai, sink: { write: (u8) => { ps3.push(u8); } } })).sha256 === sha(body), 'and downloads without a wallet');
+  await saveKeyWrap({ base: B2, token: OT, wallet, hash: up2.hash, key: up2.key });
+  ok((await unwrapKey(wallet, up2.hash, (await O.get('/v1/files')).files.find((f) => f.hash === up2.hash).keyWrap)) === up2.key, 'the v1.1 owner wrap still works');
+
+  // the server never holds the file key: look through every stored row
+  const db2 = new DatabaseSync(join(d2, 'bdrivex.db'));
+  const rows = JSON.stringify([db2.prepare('SELECT * FROM links').all(), db2.prepare('SELECT * FROM files').all()]);
+  ok(!rows.includes(up2.key) && !rows.includes(Buffer.from(up2.key, 'base64url').toString('hex')), 'no stored row contains the file key');
+
+  // revoke: the recipient loses the link, and a non-invited wallet can't sign in any more
+  await O.del(`/v1/links/${bl.id}`);
+  await rejects(linkInfo({ base: B2, id: bl.id, token: RT }), /^404/, 'a revoked bound link stops working for the recipient');
+  ok((await blobAs(RT)).status === 404, 'and its blob');
+  ok((await sign(rw, rk)).status === 403, 'with no live link left, the recipient cannot sign in again');
+
+  // expiry: same again with a link whose time is up
+  const ex = await makeLink({ base: B2, token: OT, site: 'https://bdrivex.com', hash: up2.hash, key: up2.key, ttl: 3600, recipient: rk, wallet });
+  ok((await sign(rw, rk)).status === 200, 'a new link for the recipient lets them sign in again');
+  db2.prepare('UPDATE links SET expires_at = ? WHERE id = ?').run(Date.now() - 1000, ex.id);
+  await rejects(linkInfo({ base: B2, id: ex.id, token: RT }), /^410/, 'an expired bound link says so');
+  ok((await fetch(`${B2}/v1/s/${ex.id}/blob`, { headers: { authorization: `Bearer ${RT}` } })).status === 410, 'and its blob is gone');
+  ok((await sign(rw, rk)).status === 403, 'and the recipient cannot sign in once it has expired');
+  await rejects(O.call('PUT', `/v1/links/${ex.id}/recipient`, { json: { recipient: rk, recipientWrap: 'AAAA' } }), /^410/, 'an expired link cannot be rebound');
+  db2.close();
+
+  // a recipient can sign out
+  ok((await R.call('POST', '/v1/auth/signout')).status === 204 && (await fetch(`${B2}/v1/s/${ex.id}`, { headers: { authorization: `Bearer ${RT}` } })).status === 410, 'a recipient session can sign out');
+  const rAfter = await fetch(`${B2}/v1/auth/signout`, { method: 'POST', headers: { authorization: `Bearer ${RT}` } });
+  ok(rAfter.status === 401, 'and its token stops working');
+
+  // the site's recipient parsing
+  ok(parseRecipient('$Jon')?.paymail === 'jon@bwalletx.com' && parseRecipient('jon')?.label === '$jon' && parseRecipient('jon@HandCash.io')?.label === 'jon@handcash.io' && parseRecipient('jon@') === null && parseRecipient('a b@c.d') === null, 'recipients: $handle, handle, paymail; junk refused');
+
   s2.kill(); rmSync(d2, { recursive: true, force: true });
+}
+
+// ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working
+{
+  console.log('migration from a v1.1 database');
+  const P3 = 8797, B3 = `http://127.0.0.1:${P3}`, d3 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const old = new DatabaseSync(join(d3, 'bdrivex.db'));
+  old.exec(`PRAGMA journal_mode = WAL;
+    CREATE TABLE nonces (nonce TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at INTEGER NOT NULL);
+    CREATE TABLE uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, size INTEGER NOT NULL, received INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+    CREATE TABLE files (owner TEXT NOT NULL, hash TEXT NOT NULL, size INTEGER NOT NULL, meta TEXT, created_at INTEGER NOT NULL, key_wrap TEXT, PRIMARY KEY (owner, hash));
+    CREATE TABLE links (id TEXT PRIMARY KEY, owner TEXT NOT NULL, hash TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER, revoked_at INTEGER, downloads INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (owner, hash) REFERENCES files(owner, hash) ON DELETE CASCADE);
+    CREATE TABLE revoked (sid TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+    CREATE TABLE generations (owner TEXT PRIMARY KEY, gen INTEGER NOT NULL);
+    CREATE TABLE reports (link_id TEXT PRIMARY KEY, at INTEGER NOT NULL, reason TEXT, ip TEXT);`);
+  // one small sealed file, made the way the site makes them
+  const plain = randomBytes(5000);
+  const { key: k3, header: h3 } = newSeal();
+  const ck3 = await importKey(k3);
+  const sealed = Buffer.concat([h3, await sealSegment(ck3, h3, 0, true, plain)]);
+  const hh = sha(sealed);
+  const dir = join(d3, 'blobs', hh.slice(0, 2), hh.slice(2, 4));
+  (await import('node:fs')).mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, hh), sealed);
+  const lid = randomBytes(16).toString('base64url');
+  old.prepare('INSERT INTO files (owner, hash, size, meta, created_at, key_wrap) VALUES (?, ?, ?, ?, ?, ?)').run(identityKey, hh, sealed.length, await sealMeta(ck3, h3, { name: 'old.bin', type: '', size: plain.length }), Date.now(), 'AAAA');
+  old.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(lid, identityKey, hh, Date.now(), Date.now() + 86400e3);
+  ok(!old.prepare('PRAGMA table_info(links)').all().some((c) => c.name === 'recipient'), 'the v1.1 database has no recipient columns');
+  old.close();
+  const s3 = await startServer(P3, d3, { ALLOWED_KEYS: identityKey });
+  const db3 = new DatabaseSync(join(d3, 'bdrivex.db'));
+  const cols = db3.prepare('PRAGMA table_info(links)').all().map((c) => c.name);
+  ok(['recipient', 'recipient_wrap', 'recipient_label'].every((c) => cols.includes(c)), `after start the links table has ${cols.slice(-3).join(', ')}`);
+  ok(db3.prepare("SELECT 1 AS n FROM sqlite_master WHERE type = 'index' AND name = 'links_recipient'").get()?.n === 1, 'and an index on recipient');
+  db3.close();
+  const li = await openLink({ base: B3, id: lid, key: b64u(k3) });
+  const ps4 = [];
+  const d4 = await downloadLink({ base: B3, id: lid, link: li, sink: { write: (u8) => { ps4.push(u8); } } });
+  ok(li.meta.name === 'old.bin' && d4.sha256 === sha(plain), 'a link made before the migration still opens and downloads');
+  s3.kill();
+  // a second start on the migrated database is a no-op
+  const s3b = await startServer(P3, d3, { ALLOWED_KEYS: identityKey });
+  ok((await fetch(B3 + '/health')).status === 200, 'starting again on the migrated database works (migration is idempotent)');
+  s3b.kill(); rmSync(d3, { recursive: true, force: true });
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');

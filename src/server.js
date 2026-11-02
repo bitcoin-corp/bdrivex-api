@@ -16,16 +16,28 @@
 //   GET    /v1/files                                                    -> { files: [...links, keyWrap], usage }
 //   PUT    /v1/files/:sha256/key   { keyWrap }  (null clears)           -> 204, owner only, never shown on links
 //   DELETE /v1/files/:sha256
-//   POST   /v1/links               { hash, ttl }  (seconds, default and max 30 days) -> { id, expiresAt }
+//   POST   /v1/links               { hash, ttl, recipient?, recipientLabel?, recipientWrap? }   -> { id, expiresAt }
+//                                  ttl: seconds, default and max 30 days. recipient: an identity key (v1.2, see below)
+//   PUT    /v1/links/:id/recipient { recipient, recipientWrap, recipientLabel? }  -> 204, owner only
 //   DELETE /v1/links/:id                                                -> revoke
 //   GET    /v1/s/:id               public                               -> { size, meta, createdAt, expiresAt }
 //   GET    /v1/s/:id/blob          public, Range ok                     -> ciphertext
 //   POST   /v1/s/:id/report        public { reason }                   -> the link is switched off at once
 //
+// v1.2 links sent to one person. A link with a `recipient` (identity key) is bound to that wallet:
+//   - GET /v1/s/:id shows anyone else only { bound, from, size, createdAt, expiresAt }: no meta, no wrap, nothing
+//     about the recipient. Signed in as the recipient it adds { hash, meta, recipientWrap, senderKey }.
+//   - GET /v1/s/:id/blob is served only to a session whose identity key is the recipient, else 403.
+//   - recipientWrap is the file key wrapped by the sender's wallet for the recipient (BRC-2, protocol
+//     [2,'bdrivex share'], key ID '<hash>.<link id>'). The server never has the file key. Make the link first
+//     (POST with recipient), then wrap with its id and PUT the wrap.
+//
 // Auth: Authorization: Bearer <token> from /v1/auth/verify: a 7-day session signed with SESSION_SECRET, carrying
 // aud (the site it was signed for), sid (for revoking one) and gen (bumped by sign-out-everywhere).
+// A wallet that isn't admitted (SIGNUP=invite) but is the recipient of a live link gets a recipient session instead:
+// scope 'recipient', 1 day, it can only read links addressed to it and sign out. No uploads, no files, no quota.
 import { createServer } from 'node:http';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createReadStream, createWriteStream, mkdirSync } from 'node:fs';
 import { open, rename, rm, stat, truncate } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -55,6 +67,7 @@ const EGRESS_PER_DAY = Number(env.LINK_EGRESS_BYTES_PER_DAY || 50 * GiB);
 const CHUNK_MAX = 32 * 1024 * 1024;
 const PUT_MAX = 64 * 1024 * 1024;
 const SESSION_DAYS = 7;
+const RECIPIENT_SESSION_HOURS = 24;
 // Who can sign in (CTO, 2 Nov 2026): SIGNUP=invite (default in production) admits only ALLOWED_KEYS, the owner, the
 // team and invitees, until the Online Safety Act risk assessment, terms and takedown route are in place. SIGNUP=open
 // admits any bWalletX. Local dev defaults to open.
@@ -78,6 +91,15 @@ const now = () => Date.now();
 const HASH = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9_-]{22}$/;
 const newId = () => randomBytes(16).toString('base64url');
+const KEY = /^0[23][0-9a-f]{64}$/; // compressed secp256k1 public key, lowercase hex
+const B64U = /^[A-Za-z0-9_-]+$/;
+const LABEL = /^\$?[A-Za-z0-9._+-]{1,64}(@[A-Za-z0-9.-]{1,190})?$/; // $handle, handle@domain or any paymail
+/** Constant-time string compare (identity keys, tokens). */
+const same = (a, b) => {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+};
 
 // Nonces for sign-in live in SQLite, so a restart between the two steps is harmless. take() reads and deletes at once.
 const nonceStore = {
@@ -145,14 +167,26 @@ function cors(req, res, isPublic) {
 
 const admitted = (key) => SIGNUP === 'open' || ALLOWED_KEYS.has(key);
 const genOf = (owner) => S.sessions.gen.get(owner)?.gen ?? 0;
-async function auth(req) {
+/** The verified session on this request, or a 401. */
+async function sessionFrom(req) {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
   const s = m && (await verifySession(m[1], { secret: SECRET }));
   if (!s || typeof s.sid !== 'string' || S.sessions.isRevoked.get(s.sid) || s.gen !== genOf(s.sub)) fail(401, 'Sign in with bWalletX first.');
-  if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.');
-  req.session = s;
   // A browser token works only on the site it was signed for. Agents and CLIs send no Origin.
   if (req.headers.origin && s.aud && req.headers.origin !== s.aud) fail(401, 'This sign-in belongs to another site.');
+  return s;
+}
+/** Public routes: the session if a valid one was sent, else null (a stale token is treated as none). */
+async function maybeSession(req) {
+  if (!req.headers.authorization) return null;
+  try { return await sessionFrom(req); } catch { return null; }
+}
+const isRecipientSession = (s) => s.scope === 'recipient'; // v1.1 tokens have no scope: full sessions
+async function auth(req, r) {
+  const s = await sessionFrom(req);
+  if (isRecipientSession(s)) { if (!r.recipientOk) fail(403, 'This sign-in can only open files sent to you.'); }
+  else if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.');
+  req.session = s;
   return s.sub;
 }
 
@@ -256,21 +290,28 @@ route('POST', /^\/v1\/auth\/verify$/, async (req) => {
   const b = await readJson(req);
   const key = await verifySignIn({ origin, store: nonceStore, identityKey: b.identityKey, nonce: b.nonce, signature: b.signature });
   if (!key) fail(401, 'That signature was not accepted. Start again.');
-  if (!admitted(key)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.');
-  const maxAge = SESSION_DAYS * 86400;
-  const token = await signSession({ sub: key, aud: origin, sid: newId(), gen: genOf(key) }, { secret: SECRET, maxAge });
-  return [200, { token, identityKey: key, expiresAt: now() + maxAge * 1000 }];
+  let scope = 'full', maxAge = SESSION_DAYS * 86400;
+  if (!admitted(key)) {
+    // Not invited, but someone sent this wallet a file: a recipient session that can only open it (v1.2).
+    limit(req, 'auth-recipient', 20, 3600_000, key, 10);
+    if (!S.links.liveFor.get(key, now())) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.');
+    scope = 'recipient';
+    maxAge = RECIPIENT_SESSION_HOURS * 3600;
+  }
+  const claims = { sub: key, aud: origin, sid: newId(), gen: genOf(key), ...(scope === 'recipient' ? { scope } : {}) };
+  const token = await signSession(claims, { secret: SECRET, maxAge });
+  return [200, { token, identityKey: key, expiresAt: now() + maxAge * 1000, scope }];
 });
 
 route('POST', /^\/v1\/auth\/signout$/, async (req) => {
   S.sessions.revoke.run(req.session.sid, req.session.exp * 1000);
   return [204, null];
-}, { auth: true });
+}, { auth: true, recipientOk: true });
 
 route('POST', /^\/v1\/auth\/signout-all$/, async (req, owner) => {
   S.sessions.bump.run(owner);
   return [204, null];
-}, { auth: true });
+}, { auth: true, recipientOk: true });
 
 route('GET', /^\/v1\/me$/, async (req, owner) => [200, { identityKey: owner, usage: usage(owner) }], { auth: true });
 
@@ -368,7 +409,12 @@ route('GET', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash], res) =>
   await serveBlob(req, res, hash);
 }, { auth: true, head: true, raw: true });
 
-const linkView = (l) => ({ id: l.id, createdAt: l.created_at, expiresAt: l.expires_at, revokedAt: l.revoked_at, downloads: l.downloads, reported: !!S.reports.get.get(l.id) });
+// The owner's view of a link. For a link sent to one person: who (key and the label the sender typed) and whether the
+// wrap is in place. The wrap itself is not repeated here; only the recipient needs it.
+const linkView = (l) => ({
+  id: l.id, createdAt: l.created_at, expiresAt: l.expires_at, revokedAt: l.revoked_at, downloads: l.downloads, reported: !!S.reports.get.get(l.id),
+  bound: !!l.recipient, recipient: l.recipient ?? null, recipientLabel: l.recipient_label ?? null, ready: !l.recipient || !!l.recipient_wrap,
+});
 
 route('GET', /^\/v1\/files$/, async (req, owner) => {
   const files = S.files.mine.all(owner).map((f) => ({
@@ -396,16 +442,47 @@ route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
   return [204, null];
 }, { auth: true });
 
+// v1.2 recipient fields. Every one is optional on POST; recipientWrap and recipientLabel need a recipient.
+function recipientFields(b, owner, { need = false } = {}) {
+  const { recipient = null, recipientWrap = null, recipientLabel = null, senderKey = null } = b;
+  if (senderKey != null && !same(String(senderKey).toLowerCase(), owner)) fail(400, 'senderKey must be your own identity key.');
+  if (recipient == null) {
+    if (need) fail(400, 'recipient (an identity key) is required.');
+    if (recipientWrap != null || recipientLabel != null) fail(400, 'recipientWrap and recipientLabel need a recipient.');
+    return { recipient: null, recipientWrap: null, recipientLabel: null };
+  }
+  if (typeof recipient !== 'string' || !KEY.test(recipient.toLowerCase())) fail(400, 'recipient must be an identity key: 66 hex characters starting 02 or 03.');
+  if (recipientWrap != null && (typeof recipientWrap !== 'string' || recipientWrap.length < 1 || recipientWrap.length > 1024 || !B64U.test(recipientWrap))) fail(400, 'recipientWrap must be base64url, 1 KB at most.');
+  if (recipientLabel != null && (typeof recipientLabel !== 'string' || !LABEL.test(recipientLabel))) fail(400, 'recipientLabel must be a $handle or paymail.');
+  return { recipient: recipient.toLowerCase(), recipientWrap, recipientLabel };
+}
+
 route('POST', /^\/v1\/links$/, async (req, owner) => {
   limit(req, 'link-new', 300, 3600_000, owner, 200);
-  const { hash, ttl = null } = await readJson(req);
+  const b = await readJson(req);
+  const { hash, ttl = null } = b;
   if (!HASH.test(String(hash)) || !S.files.get.get(owner, hash)) fail(404, 'No such file.');
   const max = LINK_DAYS * 86400;
   if (ttl != null && (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > max)) fail(400, `ttl is seconds, from 60 up to ${LINK_DAYS} days.`);
+  const r = recipientFields(b, owner);
   const id = newId(), t = now();
   const expiresAt = t + (ttl ?? max) * 1000;
-  S.links.add.run(id, owner, hash, t, expiresAt);
-  return [201, { id, createdAt: t, expiresAt }];
+  S.links.add.run(id, owner, hash, t, expiresAt, r.recipient, r.recipientWrap, r.recipientLabel);
+  return [201, { id, createdAt: t, expiresAt, bound: !!r.recipient }];
+}, { auth: true });
+
+// Bind a link to one person, or put the wrap in place once the wallet has made it (it needs the link id).
+// A link's recipient can be set once and never changed: for someone else, make a new link.
+route('PUT', /^\/v1\/links\/([\w-]+)\/recipient$/, async (req, owner, [id]) => {
+  limit(req, 'link-bind', 300, 3600_000, owner, 200);
+  const l = ID.test(id) && S.links.get.get(id);
+  if (!l || l.owner !== owner || l.revoked_at) fail(404, 'No such link.');
+  if (l.expires_at && l.expires_at < now()) fail(410, 'This link has expired.');
+  const r = recipientFields(await readJson(req), owner, { need: true });
+  if (r.recipientWrap == null) fail(400, 'recipientWrap is required.');
+  if (l.recipient && !same(l.recipient, r.recipient)) fail(409, 'This link is already for someone else. Make a new link.');
+  S.links.bind.run(r.recipient, r.recipientWrap, r.recipientLabel ?? l.recipient_label ?? null, id, owner);
+  return [204, null];
 }, { auth: true });
 
 route('DELETE', /^\/v1\/links\/([\w-]+)$/, async (req, owner, [id]) => {
@@ -423,16 +500,31 @@ function liveLink(id) {
   return l;
 }
 
+const SOMEONE_ELSE = 'This file was sent to someone else.';
+/** For a link sent to one person: is this request signed in as that person? */
+async function asRecipient(req, l) {
+  const s = await maybeSession(req);
+  if (!s || !same(s.sub, l.recipient)) return null;
+  limit(req, 'link-key', 240, 60_000, s.sub, 120);
+  return s;
+}
+
 route('GET', /^\/v1\/s\/([\w-]+)$/, async (req, _o, [id]) => {
   limit(req, 'link', 240, 60_000);
   const l = liveLink(id);
   const f = S.files.get.get(l.owner, l.hash);
-  return [200, { id, size: f.size, meta: f.meta, createdAt: l.created_at, expiresAt: l.expires_at }];
+  if (!l.recipient) return [200, { id, size: f.size, meta: f.meta, createdAt: l.created_at, expiresAt: l.expires_at }];
+  // Sent to one person: anyone else learns only that, who sent it, and the size and dates. Never the recipient.
+  const view = { id, bound: true, to: null, from: l.owner, size: f.size, createdAt: l.created_at, expiresAt: l.expires_at };
+  if (!(await asRecipient(req, l))) return [200, { ...view, forYou: false }];
+  if (!l.recipient_wrap) fail(409, 'The sender hasn’t finished sending this yet. Try again in a minute.');
+  return [200, { ...view, forYou: true, hash: l.hash, meta: f.meta, senderKey: l.owner, recipientWrap: l.recipient_wrap }];
 }, { public: true });
 
 route('GET', /^\/v1\/s\/([\w-]+)\/blob$/, async (req, _o, [id], res) => {
   limit(req, 'link-blob', 120, 60_000);
   const l = liveLink(id);
+  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE);
   if (req.method === 'GET') {
     const f = S.files.get.get(l.owner, l.hash);
     const from = Number(/^bytes=(\d+)-/.exec(req.headers.range || '')?.[1] || 0);
@@ -447,6 +539,8 @@ route('POST', /^\/v1\/s\/([\w-]+)\/report$/, async (req, _o, [id]) => {
   limit(req, 'report', 10, 3600_000);
   const l = ID.test(id) && S.links.get.get(id);
   if (!l) fail(404, 'No such link.');
+  // Only the recipient can see what a bound link holds, so only they can report it (and nobody else can switch it off).
+  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE);
   const { reason } = await readJson(req, 4096);
   S.reports.add.run(id, now(), String(reason || '').slice(0, 500), ip(req));
   console.warn(`[bdrivex] link ${id} reported and switched off (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…)`);
@@ -474,7 +568,7 @@ const server = createServer(async (req, res) => {
     for (const r of routes) {
       const m = r.pattern.exec(path);
       if (!m || !(r.method === req.method || (r.head && req.method === 'HEAD' && r.method === 'GET'))) continue;
-      const owner = r.auth ? await auth(req) : null;
+      const owner = r.auth ? await auth(req, r) : null;
       const out = await r.fn(req, owner, m.slice(1), res);
       if (r.raw) return;
       const [status, body, headers] = out;

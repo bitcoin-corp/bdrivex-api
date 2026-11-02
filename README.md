@@ -18,12 +18,14 @@ Node 22.13+ (`node:sqlite`), no native dependencies. Metadata in `DATA_DIR/bdriv
 1. `POST /v1/auth/challenge {identityKey}` with an `Origin` on `ALLOWED_ORIGINS` returns `{nonce, message, protocolID, keyID, expiresAt}`.
 2. The wallet signs `message`: `createSignature({protocolID, keyID, counterparty: 'anyone', data: utf8(message)})`.
    In a browser, `signInWithBwalletX` from `@bwalletx/connect` does steps 1 and 2.
-3. `POST /v1/auth/verify {identityKey, nonce, signature}` (same Origin) returns `{token, identityKey, expiresAt}`.
+3. `POST /v1/auth/verify {identityKey, nonce, signature}` (same Origin) returns `{token, identityKey, expiresAt, scope}`.
 4. Send `Authorization: Bearer <token>` on every authenticated call.
 
 Tokens last 7 days and carry `aud` (the origin they were signed for: a request with a different `Origin` is refused),
 `sid` (revoked by sign-out) and `gen` (bumped by sign-out-everywhere). Agents and CLIs send no `Origin`.
 `SIGNUP=invite` (the production default) admits only `ALLOWED_KEYS`; `SIGNUP=open` admits any bWalletX.
+A wallet that isn't admitted but is the recipient of a live link (v1.2) gets a **recipient session** instead
+(`scope: 'recipient'`, 1 day, rate-limited): it can read links addressed to it and sign out, nothing else.
 
 ## Routes
 
@@ -31,8 +33,8 @@ Tokens last 7 days and carry `aud` (the origin they were signed for: a request w
 |---|---|---|---|---|
 | POST | `/v1/auth/challenge` | Origin | `{identityKey}` | challenge |
 | POST | `/v1/auth/verify` | Origin | `{identityKey, nonce, signature}` | `{token, identityKey, expiresAt}` |
-| POST | `/v1/auth/signout` | yes | | 204, this token stops working |
-| POST | `/v1/auth/signout-all` | yes | | 204, every token for this wallet stops working |
+| POST | `/v1/auth/signout` | yes (also recipient) | | 204, this token stops working |
+| POST | `/v1/auth/signout-all` | yes (also recipient) | | 204, every token for this wallet stops working |
 | GET | `/v1/me` | yes | | `{identityKey, usage: {bytes, files, pending, quota, maxFile}}` |
 | POST | `/v1/uploads` | yes | `{size}` sealed bytes | 201 `{id, size, offset: 0, chunkMax}` |
 | GET/HEAD | `/v1/uploads/:id` | yes | | `{id, size, offset}` + `Upload-Offset` |
@@ -41,14 +43,15 @@ Tokens last 7 days and carry `aud` (the origin they were signed for: a request w
 | DELETE | `/v1/uploads/:id` | yes | | 204 |
 | PUT | `/v1/blobs/:sha256` | yes | body (at most 64 MB), optional `X-Bdx-Meta` | 201 `{hash, size}`; 422 on mismatch |
 | GET/HEAD | `/v1/blobs/:sha256` | yes (owner) | `Range` ok | ciphertext |
-| GET | `/v1/files` | yes | | `{files: [{hash, size, meta, keyWrap, createdAt, links: [{id, createdAt, expiresAt, revokedAt, downloads, reported}]}], usage}` |
+| GET | `/v1/files` | yes | | `{files: [{hash, size, meta, keyWrap, createdAt, links: [{id, createdAt, expiresAt, revokedAt, downloads, reported, bound, recipient, recipientLabel, ready}]}], usage}` |
 | PUT | `/v1/files/:sha256/key` | yes (owner) | `{keyWrap}` base64url, at most 1 KB; `null` clears | 204 |
 | DELETE | `/v1/files/:sha256` | yes | | 204; its links go too, and the blob if nobody else holds it |
-| POST | `/v1/links` | yes | `{hash, ttl?}` seconds, default and max 30 days | 201 `{id, createdAt, expiresAt}` |
+| POST | `/v1/links` | yes | `{hash, ttl?, recipient?, recipientLabel?, recipientWrap?, senderKey?}` ttl in seconds, default and max 30 days | 201 `{id, createdAt, expiresAt, bound}` |
+| PUT | `/v1/links/:id/recipient` | yes (owner) | `{recipient, recipientWrap, recipientLabel?}` | 204; 409 if the link is already for someone else |
 | DELETE | `/v1/links/:id` | yes | | 204, switched off |
-| GET | `/v1/s/:id` | public | | `{id, size, meta, createdAt, expiresAt}`; 404 off or reported, 410 expired |
-| GET/HEAD | `/v1/s/:id/blob` | public | `Range` ok | ciphertext |
-| POST | `/v1/s/:id/report` | public | `{reason}` | 204, the link is switched off at once |
+| GET | `/v1/s/:id` | public | optional session | `{id, size, meta, createdAt, expiresAt}`; bound links: see below; 404 off or reported, 410 expired |
+| GET/HEAD | `/v1/s/:id/blob` | public; bound: recipient only | `Range` ok | ciphertext; bound links 403 to anyone but the recipient |
+| POST | `/v1/s/:id/report` | public; bound: recipient only | `{reason}` | 204, the link is switched off at once |
 | GET | `/health` | public | | `{ok: true}` |
 
 Errors are `{error: "<sentence for a person>"}` with the HTTP status. 429 carries `Retry-After`.
@@ -79,6 +82,26 @@ appears on a share link.
 - Open it with `wallet.decrypt` and the same arguments. Security level 1, so a wallet asks once per site, not once per file.
 - `wrapKey`, `unwrapKey` and `saveKeyWrap` in `bdrivex-site/js/bdx-client.js` do this with any BRC-100 wallet.
 - Like everything else here, the wrap is opaque to the server: only the owner's wallet can open it.
+
+## Links sent to one person (v1.2)
+
+A link can be bound to one wallet. Its URL has no `#k`: the file key travels wrapped for the recipient instead.
+
+- `recipient`: the recipient's identity key (66 hex, `02`/`03`). The site finds it with paymail `pki` in the browser
+  (pay.bwallet.space for `@bwalletx.com`, the paymail's own `.well-known/bsvalias` otherwise), never through this server.
+- `recipientWrap` = base64url of the **sender's** `wallet.encrypt({ plaintext: key, protocolID: [2, 'bdrivex share'], keyID: '<file sha256>.<link id>', counterparty: <recipient identity key> })`.
+  The recipient opens it with `wallet.decrypt({ ciphertext, protocolID: [2, 'bdrivex share'], keyID, counterparty: <sender identity key> })`
+  and checks it is 32 bytes. Security level 2: the derivation is bound to the counterparty.
+- Since the key ID needs the link id: `POST /v1/links {hash, ttl, recipient}` first, then `PUT /v1/links/:id/recipient {recipient, recipientWrap}`.
+  Until the wrap is in place the recipient gets 409. A link's recipient is set once and can't be changed.
+- `recipientLabel` (the `$handle` or paymail the sender typed) is shown only to the sender, in `GET /v1/files`.
+- The sender is always the link's owner (`senderKey`, if sent, must be the owner's own key).
+- `GET /v1/s/:id` for anyone but the recipient: `{id, bound: true, forYou: false, to: null, from: <sender key>, size, createdAt, expiresAt}`:
+  no meta, no wrap, no hash, nothing about the recipient. Signed in as the recipient it adds `{forYou: true, hash, meta, senderKey, recipientWrap}`.
+- The blob and the report route need the recipient's session (identity keys compared in constant time); the owner
+  keeps owner access through `/v1/blobs/:sha256` only. Revoking or expiring the link ends the recipient's access, and
+  a recipient who isn't invited can then no longer sign in.
+- `makeLink`, `openBoundLink`, `wrapForRecipient` and `unwrapFromSender` in `bdrivex-site/js/bdx-client.js` do this.
 
 ## Licence
 

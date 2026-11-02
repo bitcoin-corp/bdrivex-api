@@ -29,6 +29,12 @@ export function openDb(file) {
   `);
   // v1.1: the file key wrapped by the owner's wallet (BRC-2, counterparty self). Only that wallet can open it.
   if (!db.prepare('PRAGMA table_info(files)').all().some((c) => c.name === 'key_wrap')) db.exec('ALTER TABLE files ADD COLUMN key_wrap TEXT');
+  // v1.2: a link can be sent to one person. recipient = their identity key; recipient_wrap = the file key wrapped by
+  // the sender's wallet for that key (BRC-2, protocol [2,'bdrivex share'], key ID '<hash>.<link id>'); recipient_label =
+  // the $handle or paymail the sender typed, shown only to the sender. The sender is always the link's owner.
+  const linkCols = new Set(db.prepare('PRAGMA table_info(links)').all().map((c) => c.name));
+  for (const c of ['recipient', 'recipient_wrap', 'recipient_label']) if (!linkCols.has(c)) db.exec(`ALTER TABLE links ADD COLUMN ${c} TEXT`);
+  db.exec('CREATE INDEX IF NOT EXISTS links_recipient ON links(recipient)');
   const q = (sql) => db.prepare(sql);
   return {
     db,
@@ -54,7 +60,11 @@ export function openDb(file) {
       wrap: q('UPDATE files SET key_wrap = ? WHERE owner = ? AND hash = ?'),
     },
     links: {
-      add: q('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)'),
+      add: q('INSERT INTO links (id, owner, hash, created_at, expires_at, recipient, recipient_wrap, recipient_label) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+      bind: q('UPDATE links SET recipient = ?, recipient_wrap = ?, recipient_label = ? WHERE id = ? AND owner = ?'),
+      // Is there a live link addressed to this key? (lets a wallet that isn't invited sign in to open it)
+      liveFor: q(`SELECT 1 AS n FROM links l WHERE l.recipient = ? AND l.revoked_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > ?)
+        AND NOT EXISTS (SELECT 1 FROM reports r WHERE r.link_id = l.id) LIMIT 1`),
       get: q('SELECT * FROM links WHERE id = ?'),
       forFile: q('SELECT * FROM links WHERE owner = ? AND hash = ? ORDER BY created_at DESC'),
       revoke: q('UPDATE links SET revoked_at = ? WHERE id = ? AND owner = ? AND revoked_at IS NULL'),
