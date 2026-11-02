@@ -10,7 +10,7 @@
     "dev": "node --env-file-if-exists=.env.local src/server.js",
     "start": "node src/server.js",
     "test": "node test/e2e.mjs",
-    "vendor": "esbuild vendor-src/sha256.js --bundle --format=esm --minify --outfile=../bdrivex-site/js/vendor/sha256.js"
+    "vendor": "esbuild vendor-src/sha256.js --bundle --format=esm --minify --banner:js='/*! @noble/hashes 2.4.0 sha256 (c) Paul Miller, MIT License, https://github.com/paulmillr/noble-hashes */' --outfile=../bdrivex-site/js/vendor/sha256.js"
   },
   "dependencies": {
     "@bsv/sdk": "2.8.10",
@@ -19,5 +19,6 @@
   "devDependencies": {
     "@noble/hashes": "2.4.0",
     "esbuild": "0.28.2"
-  }
+  },
+  "license": "SEE LICENSE IN LICENSE"
 }

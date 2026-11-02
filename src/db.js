@@ -22,6 +22,10 @@ export function openDb(file) {
       expires_at INTEGER, revoked_at INTEGER, downloads INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (owner, hash) REFERENCES files(owner, hash) ON DELETE CASCADE);
     CREATE INDEX IF NOT EXISTS links_file ON links(owner, hash);
+    CREATE TABLE IF NOT EXISTS revoked (sid TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS generations (owner TEXT PRIMARY KEY, gen INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS reports (
+      link_id TEXT PRIMARY KEY, at INTEGER NOT NULL, reason TEXT, ip TEXT);
   `);
   const q = (sql) => db.prepare(sql);
   return {
@@ -52,6 +56,17 @@ export function openDb(file) {
       forFile: q('SELECT * FROM links WHERE owner = ? AND hash = ? ORDER BY created_at DESC'),
       revoke: q('UPDATE links SET revoked_at = ? WHERE id = ? AND owner = ? AND revoked_at IS NULL'),
       hit: q('UPDATE links SET downloads = downloads + 1 WHERE id = ?'),
+    },
+    reports: {
+      add: q('INSERT OR IGNORE INTO reports (link_id, at, reason, ip) VALUES (?, ?, ?, ?)'),
+      get: q('SELECT at, reason FROM reports WHERE link_id = ?'),
+    },
+    sessions: {
+      revoke: q('INSERT OR IGNORE INTO revoked (sid, expires_at) VALUES (?, ?)'),
+      isRevoked: q('SELECT 1 AS r FROM revoked WHERE sid = ?'),
+      prune: q('DELETE FROM revoked WHERE expires_at < ?'),
+      gen: q('SELECT gen FROM generations WHERE owner = ?'),
+      bump: q('INSERT INTO generations (owner, gen) VALUES (?, 1) ON CONFLICT(owner) DO UPDATE SET gen = gen + 1'),
     },
     usage: q(`SELECT
       (SELECT COALESCE(SUM(size), 0) FROM files WHERE owner = ?1) AS stored,

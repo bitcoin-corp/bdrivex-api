@@ -3,6 +3,8 @@
 //
 //   POST   /v1/auth/challenge      { identityKey }                      -> challenge to sign in bWalletX
 //   POST   /v1/auth/verify         { identityKey, nonce, signature }    -> { token, identityKey, expiresAt }
+//   POST   /v1/auth/signout                                             -> this token stops working
+//   POST   /v1/auth/signout-all                                         -> every token for this wallet stops working
 //   GET    /v1/me                                                       -> { identityKey, usage }
 //   POST   /v1/uploads             { size }                             -> { id, offset: 0, chunkMax }
 //   GET    /v1/uploads/:id                                              -> { id, size, offset }
@@ -13,12 +15,14 @@
 //   GET    /v1/blobs/:sha256                                            -> the blob, owner only, Range ok
 //   GET    /v1/files                                                    -> { files: [...links], usage }
 //   DELETE /v1/files/:sha256
-//   POST   /v1/links               { hash, ttl }  (seconds, null = no expiry) -> { id, expiresAt }
+//   POST   /v1/links               { hash, ttl }  (seconds, default and max 30 days) -> { id, expiresAt }
 //   DELETE /v1/links/:id                                                -> revoke
 //   GET    /v1/s/:id               public                               -> { size, meta, createdAt, expiresAt }
 //   GET    /v1/s/:id/blob          public, Range ok                     -> ciphertext
+//   POST   /v1/s/:id/report        public { reason }                   -> the link is switched off at once
 //
-// Auth: Authorization: Bearer <token> from /v1/auth/verify (a session signed with SESSION_SECRET).
+// Auth: Authorization: Bearer <token> from /v1/auth/verify: a 7-day session signed with SESSION_SECRET, carrying
+// aud (the site it was signed for), sid (for revoking one) and gen (bumped by sign-out-everywhere).
 import { createServer } from 'node:http';
 import { createHash, randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream, mkdirSync } from 'node:fs';
@@ -37,11 +41,24 @@ const DATA = env.DATA_DIR || join(process.cwd(), 'data');
 const ORIGINS = (env.ALLOWED_ORIGINS || (PROD ? 'https://bdrivex.com,https://www.bdrivex.com' : 'http://127.0.0.1:5173,http://localhost:5173'))
   .split(',').map((s) => s.trim()).filter(Boolean);
 const GiB = 1024 ** 3;
-const QUOTA = Number(env.QUOTA_BYTES || 5 * GiB);
-const MAX_FILE = Number(env.MAX_FILE_BYTES || 5 * GiB);
+// Open sign-up, free storage (owner, 2 Nov 2026): anyone with a bWalletX gets QUOTA_BYTES until payments exist.
+// QUOTA_OVERRIDES="<identityKey>:<bytes>,..." gives the owner and team more, server-side only.
+const QUOTA = Number(env.QUOTA_BYTES || 1 * GiB);
+const QUOTA_FOR = new Map((env.QUOTA_OVERRIDES || '').split(',').map((s) => s.trim().split(':')).filter(([k, b]) => k && Number(b) > 0)
+  .map(([k, b]) => [k.toLowerCase(), Number(b)]));
+const quotaOf = (owner) => QUOTA_FOR.get(owner) ?? QUOTA;
+const MAX_FILE = Number(env.MAX_FILE_BYTES || 2 * GiB);
+const LINK_DAYS = Number(env.LINK_MAX_DAYS || 30);
+const UPLOAD_PER_DAY = Number(env.UPLOAD_BYTES_PER_DAY || 10 * GiB);
+const EGRESS_PER_DAY = Number(env.LINK_EGRESS_BYTES_PER_DAY || 50 * GiB);
 const CHUNK_MAX = 32 * 1024 * 1024;
 const PUT_MAX = 64 * 1024 * 1024;
-const SESSION_DAYS = 30;
+const SESSION_DAYS = 7;
+// Who can sign in (CTO, 2 Nov 2026): SIGNUP=invite (default in production) admits only ALLOWED_KEYS, the owner, the
+// team and invitees, until the Online Safety Act risk assessment, terms and takedown route are in place. SIGNUP=open
+// admits any bWalletX. Local dev defaults to open.
+const SIGNUP = env.SIGNUP || (PROD ? 'invite' : 'open');
+if (!['open', 'invite'].includes(SIGNUP)) throw new Error('SIGNUP must be open or invite.');
 const ALLOWED_KEYS = new Set((env.ALLOWED_KEYS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
 const TRUST_PROXY = env.TRUST_PROXY === '1';
 
@@ -98,12 +115,24 @@ async function readJson(req, limit = 64 * 1024) {
 }
 
 const ip = (req) => (TRUST_PROXY && String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()) || req.socket.remoteAddress || '?';
+// Fixed-window counters in memory (one process). limit() counts requests per IP and, when given, per identity too;
+// spend() counts bytes against a daily allowance.
 const windows = new Map();
-function limit(req, name, max, perMs) {
-  const k = name + '|' + ip(req), t = now();
+function bump(k, perMs, by = 1) {
+  const t = now();
   let w = windows.get(k);
   if (!w || t - w.start > perMs) windows.set(k, (w = { start: t, n: 0 }));
-  if (++w.n > max) fail(429, 'Too many requests. Wait a minute and try again.', { 'retry-after': String(Math.ceil(perMs / 1000)) });
+  w.n += by;
+  return w.n;
+}
+const slowDown = (perMs, msg = 'Too many requests. Wait a minute and try again.') =>
+  fail(429, msg, { 'retry-after': String(Math.ceil(Math.min(perMs, 3600_000) / 1000)) });
+function limit(req, name, max, perMs, owner, ownerMax = max) {
+  if (bump(`${name}|ip|${ip(req)}`, perMs) > max) slowDown(perMs);
+  if (owner && bump(`${name}|key|${owner}`, perMs) > ownerMax) slowDown(perMs);
+}
+function spend(name, who, bytes, max, msg) {
+  if (bump(`${name}|${who}`, 86400_000, bytes) > max) slowDown(86400_000, msg);
 }
 
 function cors(req, res, isPublic) {
@@ -113,10 +142,14 @@ function cors(req, res, isPublic) {
   res.setHeader('access-control-expose-headers', 'Upload-Offset, Upload-Length, Content-Range, Content-Length, Accept-Ranges');
 }
 
+const admitted = (key) => SIGNUP === 'open' || ALLOWED_KEYS.has(key);
+const genOf = (owner) => S.sessions.gen.get(owner)?.gen ?? 0;
 async function auth(req) {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
   const s = m && (await verifySession(m[1], { secret: SECRET }));
-  if (!s) fail(401, 'Sign in with bWalletX first.');
+  if (!s || typeof s.sid !== 'string' || S.sessions.isRevoked.get(s.sid) || s.gen !== genOf(s.sub)) fail(401, 'Sign in with bWalletX first.');
+  if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.');
+  req.session = s;
   // A browser token works only on the site it was signed for. Agents and CLIs send no Origin.
   if (req.headers.origin && s.aud && req.headers.origin !== s.aud) fail(401, 'This sign-in belongs to another site.');
   return s.sub;
@@ -124,12 +157,12 @@ async function auth(req) {
 
 function usage(owner) {
   const u = S.usage.get(owner);
-  return { bytes: u.stored, files: u.files, pending: u.pending, quota: QUOTA };
+  return { bytes: u.stored, files: u.files, pending: u.pending, quota: quotaOf(owner), maxFile: MAX_FILE };
 }
 function roomFor(owner, size) {
   if (size > MAX_FILE) fail(413, `Files up to ${Math.floor(MAX_FILE / GiB)} GB for now.`);
   const u = usage(owner);
-  if (u.bytes + u.pending + size > QUOTA) fail(413, 'That would take you over your storage allowance. Delete something first.');
+  if (u.bytes + u.pending + size > quotaOf(owner)) fail(413, 'That would take you over your storage allowance. Delete something first.');
 }
 
 const sha256File = async (path) => {
@@ -222,16 +255,26 @@ route('POST', /^\/v1\/auth\/verify$/, async (req) => {
   const b = await readJson(req);
   const key = await verifySignIn({ origin, store: nonceStore, identityKey: b.identityKey, nonce: b.nonce, signature: b.signature });
   if (!key) fail(401, 'That signature was not accepted. Start again.');
-  if (ALLOWED_KEYS.size && !ALLOWED_KEYS.has(key)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.');
+  if (!admitted(key)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.');
   const maxAge = SESSION_DAYS * 86400;
-  const token = await signSession({ sub: key, aud: origin }, { secret: SECRET, maxAge });
+  const token = await signSession({ sub: key, aud: origin, sid: newId(), gen: genOf(key) }, { secret: SECRET, maxAge });
   return [200, { token, identityKey: key, expiresAt: now() + maxAge * 1000 }];
 });
+
+route('POST', /^\/v1\/auth\/signout$/, async (req) => {
+  S.sessions.revoke.run(req.session.sid, req.session.exp * 1000);
+  return [204, null];
+}, { auth: true });
+
+route('POST', /^\/v1\/auth\/signout-all$/, async (req, owner) => {
+  S.sessions.bump.run(owner);
+  return [204, null];
+}, { auth: true });
 
 route('GET', /^\/v1\/me$/, async (req, owner) => [200, { identityKey: owner, usage: usage(owner) }], { auth: true });
 
 route('POST', /^\/v1\/uploads$/, async (req, owner) => {
-  limit(req, 'upload-new', 120, 3600_000);
+  limit(req, 'upload-new', 120, 3600_000, owner, 60);
   const { size } = await readJson(req);
   if (!Number.isSafeInteger(size) || size < 32) fail(400, 'size (bytes of sealed file) is required.');
   roomFor(owner, size);
@@ -257,6 +300,8 @@ route('PATCH', /^\/v1\/uploads\/([\w-]+)$/, async (req, owner, [id]) => {
   const off = Number(req.headers['upload-offset']);
   if (off !== u.received) fail(409, 'Offset does not match the server.', { 'upload-offset': String(u.received) });
   if (busy.has(id)) fail(409, 'This upload is already receiving a chunk.', { 'upload-offset': String(u.received) });
+  const len = Number(req.headers['content-length']) || CHUNK_MAX;
+  spend('upload', owner, Math.min(len, CHUNK_MAX), UPLOAD_PER_DAY, 'You have uploaded a lot today. Carry on tomorrow.');
   busy.add(id);
   try {
     const n = await writeBody(req, tmpPath(id), off, Math.min(CHUNK_MAX, u.size - off));
@@ -297,12 +342,13 @@ route('DELETE', /^\/v1\/uploads\/([\w-]+)$/, async (req, owner, [id]) => {
 
 // Small blobs in one request, addressed by the hash the client already knows (bPhotosX photos).
 route('PUT', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
-  limit(req, 'put', 600, 3600_000);
+  limit(req, 'put', 1200, 3600_000, owner, 600);
   const len = Number(req.headers['content-length']);
   if (!Number.isSafeInteger(len) || len < 1) fail(411, 'Content-Length is required.');
   if (len > PUT_MAX) fail(413, 'Use /v1/uploads for files over 64 MB.');
   if (S.files.get.get(owner, hash)) { req.resume(); return [200, { hash, size: len }]; }
   roomFor(owner, len);
+  spend('upload', owner, len, UPLOAD_PER_DAY, 'You have uploaded a lot today. Carry on tomorrow.');
   const id = newId(), tmp = tmpPath(id);
   await (await open(tmp, 'w')).close();
   const h = createHash('sha256');
@@ -321,7 +367,7 @@ route('GET', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash], res) =>
   await serveBlob(req, res, hash);
 }, { auth: true, head: true, raw: true });
 
-const linkView = (l) => ({ id: l.id, createdAt: l.created_at, expiresAt: l.expires_at, revokedAt: l.revoked_at, downloads: l.downloads });
+const linkView = (l) => ({ id: l.id, createdAt: l.created_at, expiresAt: l.expires_at, revokedAt: l.revoked_at, downloads: l.downloads, reported: !!S.reports.get.get(l.id) });
 
 route('GET', /^\/v1\/files$/, async (req, owner) => {
   const files = S.files.mine.all(owner).map((f) => ({
@@ -339,12 +385,13 @@ route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
 }, { auth: true });
 
 route('POST', /^\/v1\/links$/, async (req, owner) => {
-  limit(req, 'link-new', 300, 3600_000);
-  const { hash, ttl } = await readJson(req);
+  limit(req, 'link-new', 300, 3600_000, owner, 200);
+  const { hash, ttl = null } = await readJson(req);
   if (!HASH.test(String(hash)) || !S.files.get.get(owner, hash)) fail(404, 'No such file.');
-  if (ttl != null && (!Number.isSafeInteger(ttl) || ttl < 60)) fail(400, 'ttl is seconds (60 or more), or null for no expiry.');
+  const max = LINK_DAYS * 86400;
+  if (ttl != null && (!Number.isSafeInteger(ttl) || ttl < 60 || ttl > max)) fail(400, `ttl is seconds, from 60 up to ${LINK_DAYS} days.`);
   const id = newId(), t = now();
-  const expiresAt = ttl == null ? null : t + ttl * 1000;
+  const expiresAt = t + (ttl ?? max) * 1000;
   S.links.add.run(id, owner, hash, t, expiresAt);
   return [201, { id, createdAt: t, expiresAt }];
 }, { auth: true });
@@ -358,6 +405,7 @@ route('DELETE', /^\/v1\/links\/([\w-]+)$/, async (req, owner, [id]) => {
 
 function liveLink(id) {
   const l = ID.test(id) && S.links.get.get(id);
+  if (l && S.reports.get.get(id)) fail(404, 'This link was switched off after a report.');
   if (!l || l.revoked_at) fail(404, 'This link was switched off or never existed.');
   if (l.expires_at && l.expires_at < now()) fail(410, 'This link has expired. Ask the sender for a new one.');
   return l;
@@ -373,9 +421,25 @@ route('GET', /^\/v1\/s\/([\w-]+)$/, async (req, _o, [id]) => {
 route('GET', /^\/v1\/s\/([\w-]+)\/blob$/, async (req, _o, [id], res) => {
   limit(req, 'link-blob', 120, 60_000);
   const l = liveLink(id);
-  if (req.method === 'GET' && !/^bytes=([1-9]|0*[1-9])/.test(req.headers.range || '')) S.links.hit.run(id);
+  if (req.method === 'GET') {
+    const f = S.files.get.get(l.owner, l.hash);
+    const from = Number(/^bytes=(\d+)-/.exec(req.headers.range || '')?.[1] || 0);
+    spend('egress', l.owner, Math.max(0, f.size - from), EGRESS_PER_DAY, 'This sender’s files have been downloaded a lot today. Try again tomorrow.');
+    if (!from) S.links.hit.run(id);
+  }
   await serveBlob(req, res, l.hash);
 }, { public: true, head: true, raw: true });
+
+// Anyone holding a link can report it, and it is switched off at once; the owner reviews reports by hand for now.
+route('POST', /^\/v1\/s\/([\w-]+)\/report$/, async (req, _o, [id]) => {
+  limit(req, 'report', 10, 3600_000);
+  const l = ID.test(id) && S.links.get.get(id);
+  if (!l) fail(404, 'No such link.');
+  const { reason } = await readJson(req, 4096);
+  S.reports.add.run(id, now(), String(reason || '').slice(0, 500), ip(req));
+  console.warn(`[bdrivex] link ${id} reported and switched off (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…)`);
+  return [204, null];
+}, { public: true });
 
 route('GET', /^\/health$/, async () => [200, { ok: true }], { public: true });
 
@@ -414,7 +478,7 @@ const server = createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 0; // big chunks on slow links; headersTimeout still applies
-server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · origins ${ORIGINS.join(' ')}`));
+server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP}`));
 
 // Abandoned uploads (no chunk for 2 days) are cleared out hourly.
 setInterval(async () => {
@@ -423,6 +487,7 @@ setInterval(async () => {
     S.uploads.del.run(id);
     await rm(tmpPath(id), { force: true });
   }
+  S.sessions.prune.run(now());
   windows.clear();
 }, 3600_000).unref();
 
