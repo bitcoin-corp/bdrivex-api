@@ -1,0 +1,23 @@
+{
+  "name": "bdrivex-api",
+  "private": true,
+  "type": "module",
+  "description": "bDriveX storage API: wallet sign-in, resumable uploads of encrypted blobs, share links.",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env.local src/server.js",
+    "start": "node src/server.js",
+    "test": "node test/e2e.mjs",
+    "vendor": "esbuild vendor-src/sha256.js --bundle --format=esm --minify --outfile=../bdrivex-site/js/vendor/sha256.js"
+  },
+  "dependencies": {
+    "@bsv/sdk": "2.8.10",
+    "@bwalletx/connect": "0.5.4"
+  },
+  "devDependencies": {
+    "@noble/hashes": "2.4.0",
+    "esbuild": "0.28.2"
+  }
+}
