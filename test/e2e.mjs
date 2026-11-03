@@ -21,7 +21,7 @@ const wallet = new ProtoWallet(PrivateKey.fromRandom());
 const { publicKey: identityKey } = await wallet.getPublicKey({ identityKey: true });
 const data = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
 const srv = spawn(process.execPath, [join(here, '../src/server.js')], {
-  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
+  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', SHARING: 'open', QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
 const stop = () => { srv.kill(); rmSync(data, { recursive: true, force: true }); };
@@ -355,6 +355,70 @@ const startServer = async (port, dir, extra = {}) => {
   ok(parseRecipient('$Jon')?.paymail === 'jon@bwalletx.com' && parseRecipient('jon')?.label === '$jon' && parseRecipient('jon@HandCash.io')?.label === 'jon@handcash.io' && parseRecipient('jon@') === null && parseRecipient('a b@c.d') === null, 'recipients: $handle, handle, paymail; junk refused');
 
   s2.kill(); rmSync(d2, { recursive: true, force: true });
+}
+
+// ---- open sign-up, invite-only sharing: anyone stores files, only invited wallets make or bind links
+{
+  console.log('open sign-up, invite-only sharing');
+  const P4 = 8796, B4 = `http://127.0.0.1:${P4}`, d4 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const bogus = spawn(process.execPath, [join(here, '../src/server.js')], {
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(P4), DATA_DIR: d4, SESSION_SECRET: randomBytes(32).toString('hex'), SHARING: 'yes' }, stdio: 'ignore',
+  });
+  ok((await new Promise((r) => bogus.on('exit', r))) !== 0, 'SHARING must be open or invited (the server will not start otherwise)');
+  const s4 = await startServer(P4, d4, { SIGNUP: 'open', ALLOWED_KEYS: identityKey }); // SHARING not set: invited
+  const sign4 = async (w, k) => {
+    const c = await (await fetch(B4 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k }) })).json();
+    const { signature } = await w.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
+    return (await fetch(B4 + '/v1/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k, nonce: c.nonce, signature: Array.from(signature) }) })).json();
+  };
+  const small = (n, name, t) => { const b = randomBytes(n); return uploadFile({ base: B4, token: t, source: { size: n, read: async (a, z) => new Uint8Array(b.subarray(a, z)) }, name }).then((u) => ({ ...u, body: b })); };
+  const IT = (await sign4(wallet, identityKey)).token;
+  const nw = new ProtoWallet(PrivateKey.fromRandom()), nk = (await nw.getPublicKey({ identityKey: true })).publicKey; // signs up, not invited
+  const ns = await sign4(nw, nk);
+  ok(ns.token && ns.scope === 'full', 'with SIGNUP=open a wallet that is not invited signs up with a full session');
+  const N = api(B4, ns.token);
+  const nf = await small(70_000, 'mine.bin', ns.token);
+  ok(HASH(nf.hash) && (await N.get('/v1/files')).files.length === 1 && (await N.get('/v1/me')).usage.files === 1, 'its storage works: upload, list, usage');
+  const nb = Buffer.from(await (await N.call('GET', `/v1/blobs/${nf.hash}`)).arrayBuffer());
+  ok(sha(nb) === nf.hash, 'and it reads its own blob back');
+
+  const SHUT = { error: 'sharing_invite_only', message: 'Sharing links are invite-only for now. Your storage works as normal.' };
+  const raw = await fetch(B4 + '/v1/links', { method: 'POST', headers: { authorization: `Bearer ${ns.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ hash: nf.hash }) });
+  ok(raw.status === 403 && JSON.stringify(await raw.json()) === JSON.stringify(SHUT), 'POST /v1/links: 403 { error: sharing_invite_only, message }');
+  await rejects(N.post('/v1/links', { hash: nf.hash, recipient: identityKey }), /^403 Sharing links are invite-only for now\. Your storage works as normal\.$/, 'a link for one person too (and the site client shows the message)');
+  await rejects(makeLink({ base: B4, token: ns.token, site: 'https://bdrivex.com', hash: nf.hash, key: nf.key, recipient: identityKey, wallet: nw }), /^403 Sharing/, 'makeLink stops before asking the wallet to wrap anything');
+  const e403 = await N.post('/v1/links', { hash: nf.hash }).catch((e) => e);
+  ok(e403?.body?.error === 'sharing_invite_only', 'the client keeps the code on ApiError.body for the page to check');
+
+  // a link the new wallet already had (made while sharing was open) keeps working; it can't be bound, but can be switched off
+  const db4 = new DatabaseSync(join(d4, 'bdrivex.db'));
+  const oldId = randomBytes(16).toString('base64url');
+  db4.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(oldId, nk, nf.hash, Date.now(), Date.now() + 86400e3);
+  db4.close();
+  const oi = await openLink({ base: B4, id: oldId, key: nf.key });
+  const ps5 = [];
+  ok((await downloadLink({ base: B4, id: oldId, link: oi, sink: { write: (u8) => { ps5.push(u8); } } })).sha256 === sha(nf.body), 'an existing link still opens and downloads');
+  const bind = await fetch(`${B4}/v1/links/${oldId}/recipient`, { method: 'PUT', headers: { authorization: `Bearer ${ns.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ recipient: identityKey, recipientWrap: 'AAAA' }) });
+  ok(bind.status === 403 && (await bind.json()).error === 'sharing_invite_only', 'PUT /v1/links/:id/recipient is gated the same way');
+  ok((await N.get('/v1/files')).files[0].links.some((l) => l.id === oldId), 'the owner still sees it in the file list');
+  await N.del(`/v1/links/${oldId}`);
+  await rejects(openLink({ base: B4, id: oldId, key: nf.key }), /^404/, 'and can still switch it off');
+
+  // invited wallets share as before, and people they send to can open it
+  const ivf = await small(50_000, 'from-invited.bin', IT);
+  const any4 = await makeLink({ base: B4, token: IT, site: 'https://bdrivex.com', hash: ivf.hash, key: ivf.key });
+  ok(/#k=/.test(any4.url), 'an invited wallet still makes anyone-links');
+  const to4 = await makeLink({ base: B4, token: IT, site: 'https://bdrivex.com', hash: ivf.hash, key: ivf.key, recipient: nk, wallet });
+  const got4 = await openBoundLink({ base: B4, id: to4.id, token: ns.token, wallet: nw });
+  ok(to4.bound && got4.meta.name === 'from-invited.bin', 'and links for one person (POST + PUT), which the not-invited recipient opens');
+  await new Promise((r) => { s4.on('exit', r); s4.kill(); }); // free the port before the restart
+
+  // SHARING=open on the same data: the same wallet can now make links
+  const s4b = await startServer(P4, d4, { SIGNUP: 'open', SHARING: 'open', ALLOWED_KEYS: identityKey });
+  const ns2 = await sign4(nw, nk);
+  const opened4 = await api(B4, ns2.token).post('/v1/links', { hash: nf.hash });
+  ok(opened4.id && !opened4.bound, 'with SHARING=open any signed-in wallet makes links');
+  s4b.kill(); rmSync(d4, { recursive: true, force: true });
 }
 
 // ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working

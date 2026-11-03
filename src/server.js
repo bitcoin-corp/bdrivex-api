@@ -36,6 +36,8 @@
 // aud (the site it was signed for), sid (for revoking one) and gen (bumped by sign-out-everywhere).
 // A wallet that isn't admitted (SIGNUP=invite) but is the recipient of a live link gets a recipient session instead:
 // scope 'recipient', 1 day, it can only read links addressed to it and sign out. No uploads, no files, no quota.
+// SHARING=invited (default): only invited wallets (ALLOWED_KEYS) can POST /v1/links or PUT /v1/links/:id/recipient,
+// even with SIGNUP=open; anyone else gets 403 { error: 'sharing_invite_only', message }. Existing links still open.
 import { createServer } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createReadStream, createWriteStream, mkdirSync } from 'node:fs';
@@ -74,6 +76,12 @@ const RECIPIENT_SESSION_HOURS = 24;
 const SIGNUP = env.SIGNUP || (PROD ? 'invite' : 'open');
 if (!['open', 'invite'].includes(SIGNUP)) throw new Error('SIGNUP must be open or invite.');
 const ALLOWED_KEYS = new Set((env.ALLOWED_KEYS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean));
+// Who can share (owner, 3 Nov 2026): sign-up can open for private storage while links, which let one wallet's file
+// reach another person, stay with invited wallets (ALLOWED_KEYS, the same list SIGNUP=invite uses) until the legal
+// pack is done. SHARING=invited (the default everywhere) gates making and binding links; SHARING=open lets any
+// signed-in wallet make them. Links that already exist keep working either way.
+const SHARING = env.SHARING || 'invited';
+if (!['open', 'invited'].includes(SHARING)) throw new Error('SHARING must be open or invited.');
 const TRUST_PROXY = env.TRUST_PROXY === '1';
 
 let SECRET = env.SESSION_SECRET || '';
@@ -114,10 +122,11 @@ const nonceStore = {
 
 // ---------- small HTTP helpers
 
+// `code`, when given, goes out as { error: code, message } so a client can tell this refusal from the others.
 class HttpError extends Error {
-  constructor(status, message, headers) { super(message); this.status = status; this.headers = headers; }
+  constructor(status, message, headers, code) { super(message); this.status = status; this.headers = headers; this.code = code; }
 }
-const fail = (status, message, headers) => { throw new HttpError(status, message, headers); };
+const fail = (status, message, headers, code) => { throw new HttpError(status, message, headers, code); };
 
 function send(res, status, body, headers = {}) {
   if (body === undefined || body === null) { res.writeHead(status, headers); return res.end(); }
@@ -165,7 +174,10 @@ function cors(req, res, isPublic) {
   res.setHeader('access-control-expose-headers', 'Upload-Offset, Upload-Length, Content-Range, Content-Length, Accept-Ranges');
 }
 
-const admitted = (key) => SIGNUP === 'open' || ALLOWED_KEYS.has(key);
+const invited = (key) => ALLOWED_KEYS.has(key);
+const admitted = (key) => SIGNUP === 'open' || invited(key);
+const canShare = (key) => SHARING === 'open' || invited(key);
+const SHARING_SHUT = 'Sharing links are invite-only for now. Your storage works as normal.';
 const genOf = (owner) => S.sessions.gen.get(owner)?.gen ?? 0;
 /** The verified session on this request, or a 401. */
 async function sessionFrom(req) {
@@ -186,6 +198,7 @@ async function auth(req, r) {
   const s = await sessionFrom(req);
   if (isRecipientSession(s)) { if (!r.recipientOk) fail(403, 'This sign-in can only open files sent to you.'); }
   else if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.');
+  else if (r.share && !canShare(s.sub)) fail(403, SHARING_SHUT, undefined, 'sharing_invite_only');
   req.session = s;
   return s.sub;
 }
@@ -469,7 +482,7 @@ route('POST', /^\/v1\/links$/, async (req, owner) => {
   const expiresAt = t + (ttl ?? max) * 1000;
   S.links.add.run(id, owner, hash, t, expiresAt, r.recipient, r.recipientWrap, r.recipientLabel);
   return [201, { id, createdAt: t, expiresAt, bound: !!r.recipient }];
-}, { auth: true });
+}, { auth: true, share: true });
 
 // Bind a link to one person, or put the wrap in place once the wallet has made it (it needs the link id).
 // A link's recipient can be set once and never changed: for someone else, make a new link.
@@ -483,7 +496,7 @@ route('PUT', /^\/v1\/links\/([\w-]+)\/recipient$/, async (req, owner, [id]) => {
   if (l.recipient && !same(l.recipient, r.recipient)) fail(409, 'This link is already for someone else. Make a new link.');
   S.links.bind.run(r.recipient, r.recipientWrap, r.recipientLabel ?? l.recipient_label ?? null, id, owner);
   return [204, null];
-}, { auth: true });
+}, { auth: true, share: true });
 
 route('DELETE', /^\/v1\/links\/([\w-]+)$/, async (req, owner, [id]) => {
   const l = ID.test(id) && S.links.get.get(id);
@@ -579,12 +592,13 @@ const server = createServer(async (req, res) => {
     if (res.headersSent) return res.destroy();
     if (!(e instanceof HttpError)) console.error('[bdrivex]', req.method, path, e);
     const status = e instanceof HttpError ? e.status : 500;
-    send(res, status, { error: e instanceof HttpError ? e.message : 'Something went wrong on our side.' }, e.headers);
+    const body = !(e instanceof HttpError) ? { error: 'Something went wrong on our side.' } : e.code ? { error: e.code, message: e.message } : { error: e.message };
+    send(res, status, body, e.headers);
     if (status !== 500) req.resume();
   }
 });
 server.requestTimeout = 0; // big chunks on slow links; headersTimeout still applies
-server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP}`));
+server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
 
 // Abandoned uploads (no chunk for 2 days) are cleared out hourly.
 setInterval(async () => {

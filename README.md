@@ -6,6 +6,7 @@ in the share link's `#fragment`, which browsers never send to a server.
 ```sh
 pnpm install
 pnpm dev                          # http://127.0.0.1:8787, data in ./data, dev origins 127.0.0.1:5173, sign-up open
+                                  # (sharing is invite-only unless .env.local has SHARING=open or your key in ALLOWED_KEYS)
 pnpm test [file]                  # end to end with the site's client code (sign in, upload, resume, link, download)
 node scripts/dev-session.mjs      # a throwaway-key session for testing /send without a wallet
 ```
@@ -27,6 +28,12 @@ Tokens last 7 days and carry `aud` (the origin they were signed for: a request w
 A wallet that isn't admitted but is the recipient of a live link (v1.2) gets a **recipient session** instead
 (`scope: 'recipient'`, 1 day, rate-limited): it can read links addressed to it and sign out, nothing else.
 
+Sharing has its own switch, so sign-up can open for private storage first. `SHARING=invited` (the default, in every
+environment) lets only `ALLOWED_KEYS` make or bind links (`POST /v1/links`, `PUT /v1/links/:id/recipient`), even with
+`SIGNUP=open`; anyone else gets 403 `{error: "sharing_invite_only", message: "Sharing links are invite-only for now.
+Your storage works as normal."}`. `SHARING=open` lets any signed-in wallet make links. Links that already exist keep
+opening, and their owner can still switch them off, whichever way it is set.
+
 ## Routes
 
 | Method | Path | Auth | Body / headers | Returns |
@@ -46,15 +53,16 @@ A wallet that isn't admitted but is the recipient of a live link (v1.2) gets a *
 | GET | `/v1/files` | yes | | `{files: [{hash, size, meta, keyWrap, createdAt, links: [{id, createdAt, expiresAt, revokedAt, downloads, reported, bound, recipient, recipientLabel, ready}]}], usage}` |
 | PUT | `/v1/files/:sha256/key` | yes (owner) | `{keyWrap}` base64url, at most 1 KB; `null` clears | 204 |
 | DELETE | `/v1/files/:sha256` | yes | | 204; its links go too, and the blob if nobody else holds it |
-| POST | `/v1/links` | yes | `{hash, ttl?, recipient?, recipientLabel?, recipientWrap?, senderKey?}` ttl in seconds, default and max 30 days | 201 `{id, createdAt, expiresAt, bound}` |
-| PUT | `/v1/links/:id/recipient` | yes (owner) | `{recipient, recipientWrap, recipientLabel?}` | 204; 409 if the link is already for someone else |
+| POST | `/v1/links` | yes (sharing) | `{hash, ttl?, recipient?, recipientLabel?, recipientWrap?, senderKey?}` ttl in seconds, default and max 30 days | 201 `{id, createdAt, expiresAt, bound}` |
+| PUT | `/v1/links/:id/recipient` | yes (owner, sharing) | `{recipient, recipientWrap, recipientLabel?}` | 204; 409 if the link is already for someone else |
 | DELETE | `/v1/links/:id` | yes | | 204, switched off |
 | GET | `/v1/s/:id` | public | optional session | `{id, size, meta, createdAt, expiresAt}`; bound links: see below; 404 off or reported, 410 expired |
 | GET/HEAD | `/v1/s/:id/blob` | public; bound: recipient only | `Range` ok | ciphertext; bound links 403 to anyone but the recipient |
 | POST | `/v1/s/:id/report` | public; bound: recipient only | `{reason}` | 204, the link is switched off at once |
 | GET | `/health` | public | | `{ok: true}` |
 
-Errors are `{error: "<sentence for a person>"}` with the HTTP status. 429 carries `Retry-After`.
+Errors are `{error: "<sentence for a person>"}` with the HTTP status. 429 carries `Retry-After`. A refusal a client
+should tell apart comes as `{error: "<code>", message: "<sentence>"}`: so far only `sharing_invite_only` (403).
 
 ## Limits (defaults, all set by env)
 
