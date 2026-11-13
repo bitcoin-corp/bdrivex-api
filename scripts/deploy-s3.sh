@@ -41,7 +41,7 @@ S3_PREFIX_VALUE=${DEPLOY_S3_PREFIX:-blobs/}
 SMTP_HOST_DEFAULT=${DEPLOY_SMTP_HOST:-smtp.livemail.co.uk}
 REPORT_MAIL_TO_VALUE='support@bwalletx.com'
 BSTOREX_ORIGINS='https://bstorex.com,https://www.bstorex.com'
-TEST_PORTS='8792 8793 8794 8795 8796 8797 8798 8799'
+TEST_PORTS='8782 8792 8793 8794 8795 8796 8798 8799'
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
@@ -60,7 +60,7 @@ const out = (k, v) => console.log(k + "\t" + String(v ?? "").replace(/[\t\r\n]+/
 const raw = fs.readFileSync(0, "utf8");
 let list;
 try { list = JSON.parse(raw.slice(raw.indexOf("["))); } catch (e) { out("ERROR", "could not read `pm2 jlist`: " + e.message); process.exit(0); }
-const apps = list.filter((p) => String(p.pm2_env?.pm_cwd || "").includes("bdrivex-api"));
+const apps = list.filter((p) => (p.name === "bdrivex-api" || String(p.pm2_env?.pm_cwd || "").includes("bdrivex-api")));
 out("COUNT", apps.length);
 for (const p of apps) out("CANDIDATE", `pm2 id ${p.pm_id} · ${p.name} · cwd ${p.pm2_env.pm_cwd} · ${p.pm2_env.status}`);
 if (apps.length !== 1) process.exit(0);
@@ -355,7 +355,7 @@ remote_check_logs() {
   pm2 jlist </dev/null 2>/dev/null | node -e '
 const fs = require("fs"); const raw = fs.readFileSync(0, "utf8");
 let list = []; try { list = JSON.parse(raw.slice(raw.indexOf("["))); } catch {}
-for (const p of list.filter((x) => String(x.pm2_env?.pm_cwd || "").includes("bdrivex-api"))) {
+for (const p of list.filter((x) => (x.name === "bdrivex-api" || String(x.pm2_env?.pm_cwd || "").includes("bdrivex-api")))) {
   for (const f of [p.pm2_env.pm_out_log_path, p.pm2_env.pm_err_log_path]) {
     try { const s = fs.statSync(f); const t = fs.readFileSync(f, "utf8"); const ips = (t.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) || []).filter((x) => x !== "127.0.0.1").length;
       console.log(`   ${f}: ${(s.size / 1048576).toFixed(1)} MB, modified ${s.mtime.toISOString()}, IPv4-looking strings other than 127.0.0.1: ${ips}`);
@@ -434,7 +434,7 @@ local_main() {
   local count; count=$(get COUNT)
   getall CANDIDATE | sed 's/^/   found: /'
   [ -z "$err" ] || { printf '%s\n' "$err" | sed 's/^/   /'; die "inspection failed (above)"; }
-  [ "$count" = 1 ] || die "expected exactly one pm2 app with bdrivex-api in its cwd, found ${count:-0}"
+  [ "$count" = 1 ] || die "expected exactly one pm2 app named bdrivex-api (or with bdrivex-api in its cwd), found ${count:-0}"
   local name pmid cwd mode inst envf envsrc overrides nodev datadir port
   name=$(get NAME); pmid=$(get PM_ID); cwd=$(get CWD); mode=$(get EXEC_MODE); inst=$(get INSTANCES)
   envf=$(get ENV_FILE); envsrc=$(get ENV_SOURCE); overrides=$(get PM2_OVERRIDES); nodev=$(get NODE_VERSION)

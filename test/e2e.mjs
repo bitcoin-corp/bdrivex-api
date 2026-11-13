@@ -749,7 +749,8 @@ const startServer = async (port, dir, extra = {}) => {
 // ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working
 {
   console.log('migration from a v1.1 database');
-  const P3 = 8797, B3 = `http://127.0.0.1:${P3}`, d3 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const P3 = 8782, // not 8797: the live bdrivex-api listens there (13 Nov 2026)
+   B3 = `http://127.0.0.1:${P3}`, d3 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
   const old = new DatabaseSync(join(d3, 'bdrivex.db'));
   old.exec(`PRAGMA journal_mode = WAL;
     CREATE TABLE nonces (nonce TEXT PRIMARY KEY, data TEXT NOT NULL, expires_at INTEGER NOT NULL);
