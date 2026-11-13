@@ -175,7 +175,7 @@ ok(m5.code === 2 && /S3_SECRET_ACCESS_KEY/.test(m5.out), 'missing settings: exit
 
 console.log('mirror-to-b2');
 const B2ENV = { B2_ENDPOINT: fake.endpoint, B2_REGION: 'fsn1', B2_BUCKET: 'b2', B2_ACCESS_KEY_ID: 'test-b2-key', B2_SECRET_ACCESS_KEY: 'test-b2-secret' };
-const MENV = { ...S3ENV, ...B2ENV };
+const MENV = { ...S3ENV, ...B2ENV, DATA_DIR: mkdtempSync(join(tmpdir(), 'bdrivex-nodb-')) }; // copy only: no database
 // B2 already has one of them; and keeps one the primary no longer has
 mkdirSync(join(root, 'b2', 'm'), { recursive: true });
 writeFileSync(join(root, 'b2', 'm', local[0].h), local[0].b);
@@ -205,50 +205,119 @@ ok(r5.code === 1 && /size mismatches 1/.test(r5.out) && readFileSync(fake.object
 const r6 = await run('mirror-to-b2.mjs', [], { ...S3ENV });
 ok(r6.code === 2 && /B2_ENDPOINT/.test(r6.out), 'missing B2 settings: exit 2');
 
-console.log('mirror-to-b2 --prune');
-writeFileSync(fake.objectPath('b2', `m/${local[2].h}`), local[2].b); // put the short copy right again
-writeFileSync(join(root, 'b2', 'm', 'notes.txt'), 'not a blob');
-const b2Files = () => readdirSync(join(root, 'b2', 'm')).sort().join(',');
+console.log('mirror-to-b2 --prune (only blobs in the deletion log)');
+// A small world of its own: primary other/p/, B2 b2/p/, and an API database with file rows and the deletion log.
+const pd = mkdtempSync(join(tmpdir(), 'bdrivex-prune-'));
+const PENV = { ...S3ENV, ...B2ENV, S3_PREFIX: 'p/', DATA_DIR: pd };
+const pc = createS3Client({ ...cfg, bucket: 'other' });
+const pdb = openDb(join(pd, 'bdrivex.db'));
+const OWNER = '02' + 'c'.repeat(64);
+const blobsP = {};
+for (const name of ['A', 'B', 'C', 'D', 'E', 'F', 'G']) {
+  const b = randomBytes(300 + name.charCodeAt(0)), h = sha(b);
+  await pc.put(`p/${h}`, { body: b, size: b.length, sha256: h });
+  pdb.files.add.run(OWNER, h, b.length, null, Date.now());
+  blobsP[name] = { b, h };
+}
+const inB2 = (x) => existsSync(fake.objectPath('b2', `p/${blobsP[x].h}`));
+const inPrim = (x) => existsSync(fake.objectPath('other', `p/${blobsP[x].h}`));
 const last = (r) => r.out.trim().split('\n').at(-1);
-// B2 now: the 5 primary blobs, plus goneH (no longer in the primary) and notes.txt (not a blob)
-ok(existsSync(fake.objectPath('b2', `m/${goneH}`)), 'before: B2 still has a blob the primary no longer has (mirroring without --prune never deletes)');
-const p0 = await run('mirror-to-b2.mjs', ['--prune', '--dry-run'], MENV);
-ok(p0.code === 0 && p0.out.includes(`would delete b2/m/${goneH}`) && /prune dry run: would delete 1/.test(p0.out) && existsSync(fake.objectPath('b2', `m/${goneH}`)), `--prune --dry-run deletes nothing: ${last(p0)}`);
+// what the API does on a user's delete: the row goes, the deletion log is written, the primary blob is deleted
+const userDelete = async (x) => { pdb.files.del.run(OWNER, blobsP[x].h); pdb.erased.add.run(blobsP[x].h, Date.now(), 'user delete'); await pc.del(`p/${blobsP[x].h}`); };
+const erasedRow = (x) => { const d = new DatabaseSyncRO(join(pd, 'bdrivex.db'), { readOnly: true }); try { return d.prepare('SELECT * FROM erased_blobs WHERE hash = ?').get(blobsP[x].h); } finally { d.close(); } };
+const q0 = await run('mirror-to-b2.mjs', [], PENV);
+ok(q0.code === 0 && /copied 7/.test(q0.out) && Object.keys(blobsP).every(inB2), `the backup starts with all 7: ${last(q0)}`);
+
+// 1. a loss on the primary side (bad migration, bucket mishap): D's blob is gone, its file row is not
+rmSync(fake.objectPath('other', `p/${blobsP.D.h}`));
 fake.requests.length = 0;
-const p1 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
-ok(p1.code === 0 && p1.out.includes(`deleted b2/m/${goneH}`) && /prune done: deleted 1, failed 0/.test(p1.out), `--prune deletes from B2 what the primary no longer has, and logs the key: ${last(p1)}`);
-ok(!existsSync(fake.objectPath('b2', `m/${goneH}`)) && existsSync(join(root, 'b2', 'm', 'notes.txt')) && local.every(({ h }) => existsSync(fake.objectPath('b2', `m/${h}`))), 'only that blob went: the primary\'s blobs and the non-blob key stay');
-ok(fake.requests.filter((r) => r.method === 'DELETE').every((r) => r.bucket === 'b2'), 'deletes go only to B2, never to the primary');
-// two blobs deleted from the primary (2 of B2's 5 blobs = 40%)
-rmSync(fake.objectPath('other', `m/${local[1].h}`)); rmSync(fake.objectPath('other', `m/${local[3].h}`));
-let snap = b2Files();
-const p2 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0'], MENV);
-ok(p2.code === 1 && /prune refused: it would delete 2 of 5/.test(p2.out) && b2Files() === snap, `more than 10% refused (exit 1), nothing deleted: ${last(p2)}`);
-const p3 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0', '--force', '--dry-run'], MENV);
-ok(p3.code === 0 && /would delete 2/.test(p3.out) && b2Files() === snap, '--force lets it through (here a dry run)');
-const p4 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0'], { ...MENV, S3_PREFIX: 'nothing/', B2_PREFIX: 'm/' });
-ok(p4.code === 1 && /primary listing .* is empty/.test(p4.out) && b2Files() === snap, `an empty primary listing (wrong prefix) is refused even under the share limit: ${last(p4)}`);
-const p4f = await run('mirror-to-b2.mjs', ['--prune', '--force'], { ...MENV, S3_PREFIX: 'nothing/', B2_PREFIX: 'm/' });
-ok(p4f.code === 1 && b2Files() === snap, 'and even with --force');
+const q1 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(inB2('D') && !fake.requests.some((r) => r.method === 'DELETE'), 'a blob lost from the primary is NOT pruned from B2 (nothing is deleted at all)');
+ok(q1.code === 1 && q1.out.includes(`LOST from the primary, restorable from B2: ${blobsP.D.h}`) && /lost 1/.test(q1.out), `and the nightly run says so and exits 1: ${last(q1)}`);
+fake.requests.length = 0;
+const q2 = await run('mirror-to-b2.mjs', ['--restorable'], PENV);
+ok(q2.code === 0 && q2.out.includes(blobsP.D.h) && /report only/.test(q2.out) && /lost 1, erased 0, unreferenced 0/.test(q2.out) && !fake.requests.some((r) => r.method === 'PUT' || r.method === 'DELETE'), `--restorable lists it, copying and deleting nothing: ${last(q2)}`);
+const q3 = await run('mirror-to-b2.mjs', ['--restore', '--dry-run'], PENV);
+ok(q3.code === 1 && /would restore 1/.test(q3.out) && !inPrim('D'), '--restore --dry-run says what it would copy back');
+const q4 = await run('mirror-to-b2.mjs', ['--restore'], PENV);
+ok(q4.code === 0 && /restored 1/.test(q4.out) && readFileSync(fake.objectPath('other', `p/${blobsP.D.h}`)).equals(blobsP.D.b), `--restore copies it back from B2 to the primary: ${last(q4)}`);
+
+// 2. a user delete: E is in the deletion log and gone from the primary
+await userDelete('E');
+const q5 = await run('mirror-to-b2.mjs', ['--prune', '--dry-run'], PENV);
+ok(q5.code === 0 && q5.out.includes(`would delete b2/p/${blobsP.E.h}`) && inB2('E') && erasedRow('E').b2_pruned_at === null, `--prune --dry-run: would delete the erased blob, deletes nothing, marks nothing: ${last(q5)}`);
+fake.requests.length = 0;
+const q6 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(q6.code === 0 && !inB2('E') && q6.out.includes(`deleted b2/p/${blobsP.E.h}`) && /user delete/.test(q6.out) && /deleted 1, failed 0/.test(q6.out), `a user delete IS pruned from B2, logged with its reason: ${last(q6)}`);
+ok(Number.isInteger(erasedRow('E').b2_pruned_at) && fake.requests.filter((r) => r.method === 'DELETE').every((r) => r.bucket === 'b2'), 'b2_pruned_at is recorded; the delete went to B2 only');
+ok(['A', 'B', 'C', 'D', 'F', 'G'].every(inB2), 'nothing else left B2');
+const prunedAt = erasedRow('E').b2_pruned_at;
+const q7 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(q7.code === 0 && /deleted 0/.test(q7.out) && erasedRow('E').b2_pruned_at === prunedAt, 'each erasure is pruned once (b2_pruned_at unchanged on the next run)');
+
+// 3. delete then upload again: the API clears the log row on upload, so F stays in B2
+await userDelete('F');
+await pc.put(`p/${blobsP.F.h}`, { body: blobsP.F.b, size: blobsP.F.b.length, sha256: blobsP.F.h });
+pdb.files.add.run(OWNER, blobsP.F.h, blobsP.F.b.length, null, Date.now()); pdb.erased.clear.run(blobsP.F.h);
+// and a log row that is somehow still there for a blob that is live again (row present) is not pruned either
+pdb.files.del.run(OWNER, blobsP.G.h); pdb.erased.add.run(blobsP.G.h, Date.now(), 'user delete'); await pc.del(`p/${blobsP.G.h}`);
+pdb.files.add.run(OWNER, blobsP.G.h, blobsP.G.b.length, null, Date.now()); // live again, log row left behind
+const q8 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(inB2('F') && inPrim('F') && /deleted 0/.test(q8.out), `delete then upload again is NOT pruned: ${last(q8)}`);
+ok(inB2('G') && q8.code === 1 && q8.out.includes(`LOST from the primary, restorable from B2: ${blobsP.G.h}`), 'a log row for a blob a file row holds again is never pruned (and its missing primary copy is flagged)');
+await pc.put(`p/${blobsP.G.h}`, { body: blobsP.G.b, size: blobsP.G.b.length, sha256: blobsP.G.h });
+
+// 4. a primary delete that hasn't happened yet (the API is retrying it): waits, no prune
+pdb.files.del.run(OWNER, blobsP.C.h); pdb.erased.add.run(blobsP.C.h, Date.now(), 'user delete'); // blob still in the primary
+const q9 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(q9.code === 0 && inB2('C') && /waiting 1/.test(q9.out), `erased but still in the primary (delete being retried): waits: ${last(q9)}`);
+await pc.del(`p/${blobsP.C.h}`);
+
+// 5. removed from the primary with no log row (as scripts/orphan-blobs.mjs --delete does): kept, "unreferenced"
+pdb.files.del.run(OWNER, blobsP.B.h); await pc.del(`p/${blobsP.B.h}`);
+const q10 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(inB2('B') && !inB2('C') && /deleted 1/.test(q10.out) && /unreferenced 1/.test(q10.out), `a blob removed without a log row stays in B2 (unreferenced); C, now gone from the primary, is pruned: ${last(q10)}`);
+const q11 = await run('mirror-to-b2.mjs', ['--restorable'], PENV);
+ok(q11.out.includes(`in B2 only (unreferenced): ${blobsP.B.h}`), '--restorable lists it as unreferenced');
+
+// 6. erased before B2 had a copy: nothing to delete, marked
+const early = sha(randomBytes(20));
+pdb.erased.add.run(early, Date.now(), 'user delete');
+const q12 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(q12.code === 0 && /marked 1/.test(q12.out), 'an erasure B2 never had a copy of is marked done');
+
+// guards
+const snapB2 = () => readdirSync(join(root, 'b2', 'p')).sort().join(',');
+for (const x of ['A', 'D']) await userDelete(x);
+let snap = snapB2();
+const g1 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0'], PENV);
+ok(g1.code === 1 && /prune refused: 2 erased blobs is more than 10%/.test(g1.out) && snapB2() === snap, `more than 10% of B2 (floor 0): refused, nothing deleted: ${last(g1)}`);
+const g2 = await run('mirror-to-b2.mjs', ['--prune'], { ...PENV, S3_PREFIX: 'nothing/', B2_PREFIX: 'p/' });
+ok(g2.code === 1 && /primary listing .* is empty/.test(g2.out) && snapB2() === snap, `an empty primary listing while the database has files: refused: ${last(g2)}`);
 fake.failNext('GET', 500, 1, 'other');
-const p5 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
-ok(p5.code === 1 && /prune REFUSED \(listing failed\)/.test(p5.out) && b2Files() === snap, `a primary listing that fails: no prune (exit 1): ${last(p5)}`);
+const g3 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(g3.code === 1 && /prune REFUSED \(listing failed\)/.test(g3.out) && snapB2() === snap, 'a primary listing that fails: refused');
 fake.breakListing('other');
-const p6 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+const g4 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
 fake.breakListing('other', false);
-ok(p6.code === 1 && /TruncatedListing/.test(p6.out) && /prune REFUSED/.test(p6.out) && b2Files() === snap, `a primary listing cut short (truncated, no token): no prune (exit 1): ${last(p6)}`);
+ok(g4.code === 1 && /TruncatedListing/.test(g4.out) && snapB2() === snap, 'a primary listing cut short: refused');
 fake.breakListing('b2');
-const p6b = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+const g5 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
 fake.breakListing('b2', false);
-ok(p6b.code === 1 && /prune REFUSED/.test(p6b.out) && b2Files() === snap, 'a B2 listing cut short: no prune either');
-const p7 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
-ok(p7.code === 0 && /deleted 2, failed 0/.test(p7.out) && !existsSync(fake.objectPath('b2', `m/${local[1].h}`)) && !existsSync(fake.objectPath('b2', `m/${local[3].h}`)), `with the default floor (25 objects) a small bucket prunes normally: ${last(p7)}`);
+ok(g5.code === 1 && snapB2() === snap, 'a B2 listing cut short: refused');
 fake.failNext('DELETE', 503, 1, 'b2');
-rmSync(fake.objectPath('other', `m/${local[0].h}`));
-const p8 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
-ok(p8.code === 1 && /deleted 0, failed 1/.test(p8.out) && existsSync(fake.objectPath('b2', `m/${local[0].h}`)), 'a B2 delete that fails: exit 1, tried again next night');
-const p9 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
-ok(p9.code === 0 && /deleted 1, failed 0/.test(p9.out), 'and the next run deletes it');
+const g6 = await run('mirror-to-b2.mjs', ['--prune', '--concurrency=1'], PENV);
+ok(g6.code === 1 && /deleted 1, failed 1/.test(g6.out), 'a B2 delete that fails: exit 1, not marked');
+const g7 = await run('mirror-to-b2.mjs', ['--prune'], PENV);
+ok(g7.code === 0 && /deleted 1, failed 0/.test(g7.out) && !inB2('A') && !inB2('D'), 'and the next run prunes it');
+const g8 = await run('mirror-to-b2.mjs', ['--prune'], { ...PENV, DATA_DIR: join(pd, 'nope') });
+ok(g8.code === 2 && /needs the API database/.test(g8.out), '--prune without the database: exit 2');
+const oldDb = mkdtempSync(join(tmpdir(), 'bdrivex-olddb-'));
+{ const d = new DatabaseSyncRO(join(oldDb, 'bdrivex.db')); d.exec('CREATE TABLE files (owner TEXT, hash TEXT, size INTEGER, meta TEXT, created_at INTEGER)'); d.close(); }
+const g9 = await run('mirror-to-b2.mjs', ['--prune'], { ...PENV, DATA_DIR: oldDb });
+ok(g9.code === 2 && /no erased_blobs table/.test(g9.out), 'a database from before the deletion log: exit 2, nothing pruned');
+pdb.db.close(); pc.close();
+rmSync(pd, { recursive: true, force: true }); rmSync(oldDb, { recursive: true, force: true });
 
 console.log('orphan-blobs');
 const od = mkdtempSync(join(tmpdir(), 'bdrivex-orphans-'));

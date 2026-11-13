@@ -21,7 +21,7 @@ const { startFakeS3 } = await import('./fake-s3.mjs');
 // Where blobs go: the fs store (default) or, with BLOB_STORE=s3, a fake S3 bucket here, one prefix per server's data dir.
 const S3 = process.env.BLOB_STORE === 's3';
 const s3root = S3 ? mkdtempSync(join(tmpdir(), 'bdrivex-fake-s3-')) : null;
-const s3fake = S3 ? await startFakeS3({ root: s3root, region: 'fsn1', credentials: { 'test-key-id': 'test-secret' }, buckets: ['bdrivex'] }) : null;
+const s3fake = S3 ? await startFakeS3({ root: s3root, region: 'fsn1', credentials: { 'test-key-id': 'test-secret' }, buckets: ['bdrivex', 'b2mirror'] }) : null;
 const storeEnv = (dir) => S3
   ? { BLOB_STORE: 's3', S3_ENDPOINT: s3fake.endpoint, S3_REGION: 'fsn1', S3_BUCKET: 'bdrivex', S3_ACCESS_KEY_ID: 'test-key-id', S3_SECRET_ACCESS_KEY: 'test-secret', S3_PREFIX: `${basename(dir)}/`, BLOB_DELETE_RETRY_MS: '300' }
   : { BLOB_STORE: 'fs' };
@@ -274,6 +274,43 @@ if (S3) {
   for (let i = 0; i < 50 && pendingRows().length; i++) await new Promise((r) => setTimeout(r, 100));
   ok(pendingRows().length === 0 && existsSync(blobFile(data, oh)) && readFileSync(blobFile(data, oh)).equals(ob), 'a recorded blob that was uploaded again before the retry is kept');
   await api(BASE, st.token).del(`/v1/files/${oh}`);
+
+  // the deletion log, written by the server, and the B2 mirror pruning by it (and only by it)
+  const erased = (h) => { const d = new DatabaseSync(join(data, 'bdrivex.db')); try { return d.prepare('SELECT * FROM erased_blobs WHERE hash = ?').get(h); } finally { d.close(); } };
+  ok(erased(oh)?.reason === 'user delete', 'deleting the last holder writes the deletion log (erased_blobs, reason user delete)');
+  const mirror = (args) => new Promise((resolve) => {
+    const p = spawn(process.execPath, [join(here, '../scripts/mirror-to-b2.mjs'), ...args], {
+      env: { PATH: process.env.PATH, DATA_DIR: data, ...storeEnv(data), B2_ENDPOINT: s3fake.endpoint, B2_REGION: 'fsn1', B2_BUCKET: 'b2mirror', B2_ACCESS_KEY_ID: 'test-key-id', B2_SECRET_ACCESS_KEY: 'test-secret' },
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = ''; p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { out += d; });
+    p.on('exit', (code) => resolve({ code, out, last: out.trim().split('\n').at(-1) }));
+  });
+  const inB2 = (h) => existsSync(s3fake.objectPath('b2mirror', `${basename(data)}/${h}`));
+  const put = async (b) => { const h = sha(b); await api(BASE, T2).call('PUT', `/v1/blobs/${h}`, { body: b }); return h; };
+  const [kb, rb, lb] = [randomBytes(4000), randomBytes(4100), randomBytes(4200)];
+  const [kh, rh, lh] = [await put(kb), await put(rb), await put(lb)];
+  const mm0 = await mirror(['--prune']);
+  ok(mm0.code === 0 && [kh, rh, lh].every(inB2), `mirror: the three new blobs are in B2: ${mm0.last}`);
+  // a user delete: pruned from B2
+  await api(BASE, T2).del(`/v1/files/${kh}`);
+  ok(erased(kh) && erased(kh).b2_pruned_at === null && !existsSync(blobFile(data, kh)), 'a user delete: blob gone from the primary, logged');
+  // delete then upload again: the log row is cleared, so it stays in B2
+  await api(BASE, T2).del(`/v1/files/${rh}`);
+  ok(erased(rh), 'deleted: logged');
+  await put(rb);
+  ok(!erased(rh), 'uploaded again: the log row is cleared');
+  // a loss on the primary side: the blob vanishes from the bucket, the file row stays
+  rmSync(blobFile(data, lh));
+  const mm1 = await mirror(['--prune']);
+  ok(!inB2(kh) && mm1.out.includes(`deleted b2mirror/${basename(data)}/${kh}`) && Number.isInteger(erased(kh).b2_pruned_at), `server + mirror: a user delete IS pruned from B2, and marked: ${mm1.last}`);
+  ok(inB2(rh) && existsSync(blobFile(data, rh)), 'delete then upload again is NOT pruned');
+  ok(inB2(lh) && mm1.code === 1 && mm1.out.includes(`LOST from the primary, restorable from B2: ${lh}`), 'a primary-side loss is NOT pruned, and the run flags it (exit 1)');
+  const mm2 = await mirror(['--restorable']);
+  ok(mm2.code === 0 && mm2.out.includes(lh) && /lost 1/.test(mm2.out), `--restorable lists it: ${mm2.last}`);
+  const mm3 = await mirror(['--restore']);
+  const back2 = Buffer.from(await (await api(BASE, T2).call('GET', `/v1/blobs/${lh}`)).arrayBuffer());
+  ok(mm3.code === 0 && back2.equals(lb), 'after --restore the owner downloads it again');
+  for (const h of [rh, lh]) await api(BASE, T2).del(`/v1/files/${h}`);
 }
 
 // ---- invite-only mode: a second server that admits only the test wallet (and a second invited wallet, O2)
