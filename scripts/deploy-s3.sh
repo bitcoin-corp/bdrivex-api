@@ -19,7 +19,8 @@
 #      plus bdrivex-site/js for the tests. The live app dir is not touched.
 #   4. Asks, on the server, for S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY (hidden input over ssh -t; they are never
 #      echoed, never on a command line, never sent back) and writes them, with S3_ENDPOINT, S3_REGION, S3_BUCKET and
-#      S3_PREFIX, into the env file, mode 600.
+#      S3_PREFIX, into the env file, mode 600. Then, if you want (skippable), the SMTP settings for report emails to
+#      support@bwalletx.com, with SMTP_PASS typed the same hidden way; you can send one test email.
 #   5. Runs the three test suites in the staging dir on the server.
 #   6. Checks the keys against the bucket (list, then write/read/delete one probe object under _deploy-check/) and
 #      runs migrate-blobs-to-s3.mjs --dry-run against the live data. Shows the result.
@@ -35,8 +36,12 @@ S3_ENDPOINT_VALUE=${DEPLOY_S3_ENDPOINT:-https://fsn1.your-objectstorage.com}
 S3_REGION_VALUE=${DEPLOY_S3_REGION:-fsn1}
 S3_BUCKET_VALUE=${DEPLOY_S3_BUCKET:-bcorp-bdrivex-files}
 S3_PREFIX_VALUE=${DEPLOY_S3_PREFIX:-blobs/}
+# Report emails (owner, Nov 2026): one mailbox, support@bwalletx.com on Fasthosts. The host is a suggestion you can
+# change at the prompt (Fasthosts' outgoing server; check it in the Fasthosts control panel). DEPLOY_SMTP_HOST overrides.
+SMTP_HOST_DEFAULT=${DEPLOY_SMTP_HOST:-smtp.livemail.co.uk}
+REPORT_MAIL_TO_VALUE='support@bwalletx.com'
 BSTOREX_ORIGINS='https://bstorex.com,https://www.bstorex.com'
-TEST_PORTS='8794 8795 8796 8797 8798 8799'
+TEST_PORTS='8792 8793 8794 8795 8796 8797 8798 8799'
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
@@ -105,10 +110,13 @@ if (envFile) {
     for (const line of fs.readFileSync(abs, "utf8").split(/\r?\n/)) { const m = /^(?:export\s+)?([A-Z0-9_]+)=(.*)$/.exec(line); if (m) kv[m[1]] = m[2].replace(/^(["'"'"'])(.*)\1$/, "$2"); }
     for (const k of ["DATA_DIR", "PORT", "HOST", "NODE_ENV", "BLOB_STORE", "ALLOWED_ORIGINS"]) if (k in kv) out("FILE_" + k, kv[k]);
     out("FILE_S3_SET", Object.keys(kv).filter((k) => k.startsWith("S3_")).join(" "));
+    out("FILE_SMTP_SET", Object.keys(kv).filter((k) => k.startsWith("SMTP_") || k === "REPORT_MAIL_TO").join(" "));
+    for (const k of ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "REPORT_MAIL_TO"]) if (k in kv) out("FILE_" + k, kv[k]);
   } catch (err) { out("ERROR", `env file ${abs}: ${err.message}`); }
 }
 const penv = { ...e, ...(e.env || {}) };
-const overrides = ["BLOB_STORE", "S3_ENDPOINT", "S3_REGION", "S3_BUCKET", "S3_PREFIX", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY"].filter((k) => k in penv);
+const overrides = ["BLOB_STORE", "S3_ENDPOINT", "S3_REGION", "S3_BUCKET", "S3_PREFIX", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY",
+  "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "REPORT_MAIL_TO"].filter((k) => k in penv);
 out("PM2_OVERRIDES", overrides.join(" "));
 for (const k of ["DATA_DIR", "PORT", "HOST", "NODE_ENV", "ALLOWED_ORIGINS"]) if (k in penv && penv[k] !== undefined && penv[k] !== "") out("PM2_" + k, penv[k]);
 for (const d of ["@bsv/sdk", "@bwalletx/connect"]) { try { out("DEP", `${d} ${JSON.parse(fs.readFileSync(path.join(cwd, "node_modules", d, "package.json"), "utf8")).version}`); } catch { out("DEP_MISSING", d); } }
@@ -156,8 +164,13 @@ remote_prepare_stage() {
 
 # Interactive (ssh -t): ask for the two keys with hidden input and write the S3 settings into the env file.
 remote_set_keys() {
-  local file=$1 ak='' sk='' tries=0 has_ak has_sk answer keyre='^[A-Za-z0-9._/+=-]{8,255}$'
   [ -t 0 ] || { say "set-keys needs a terminal (ssh -t)"; return 1; }
+  remote_set_s3_keys "$1" || return 1
+  remote_set_smtp "$1"
+}
+
+remote_set_s3_keys() {
+  local file=$1 ak='' sk='' tries=0 has_ak has_sk answer keyre='^[A-Za-z0-9._/+=-]{8,255}$'
   has_ak=$(grep -cE '^(export )?S3_ACCESS_KEY_ID=.+' "$file" || true)
   has_sk=$(grep -cE '^(export )?S3_SECRET_ACCESS_KEY=.+' "$file" || true)
   if [ "$has_ak" != 0 ] && [ "$has_sk" != 0 ]; then
@@ -183,14 +196,38 @@ remote_set_keys() {
   say "wrote S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_PREFIX and the two keys to $file (mode 600)."
 }
 
+# Optional: SMTP for report emails. Host, port and user are shown as you type (not secret); the password is hidden.
+# Skipping leaves report mail as it is (off if never set: the API then only logs reports).
+remote_set_smtp() {
+  local file=$1 answer host port user pass='' have
+  have=$(grep -cE '^(export )?SMTP_PASS=.+' "$file" || true)
+  if [ "$have" != 0 ]; then read -r -p "Report email (SMTP) is already set up in $file. Change it? [y/N] " answer
+  else read -r -p "Set up report emails to $REPORT_MAIL_TO_VALUE now (SMTP; you can skip)? [y/N] " answer; fi
+  if [ "$answer" != y ] && [ "$answer" != Y ]; then say "report email: skipped (left as it was)."; return 0; fi
+  read -r -p "SMTP host [$SMTP_HOST_DEFAULT]: " host; host=${host:-$SMTP_HOST_DEFAULT}
+  read -r -p "SMTP port, 465 = TLS, 587 = STARTTLS [465]: " port; port=${port:-465}
+  read -r -p "SMTP user [$REPORT_MAIL_TO_VALUE]: " user; user=${user:-$REPORT_MAIL_TO_VALUE}
+  if ! [[ "$host" =~ ^[A-Za-z0-9.-]+$ ]] || ! [[ "$port" =~ ^[0-9]{2,5}$ ]] || ! [[ "$user" =~ ^[^[:space:]\'\"@]+@[A-Za-z0-9.-]+$ ]]; then
+    say "that host, port or user doesn't look right; report email skipped, nothing written."; return 0
+  fi
+  IFS= read -r -s -p "SMTP password for $user (hidden; empty skips): " pass; printf '\n'
+  if [ -z "$pass" ]; then say "report email: skipped, nothing written."; return 0; fi
+  case $pass in *"'"* | *$'\n'* | *$'\r'*) pass=''; say "a password with a single quote or line break can't be written safely; skipped, nothing written."; return 0 ;; esac
+  write_env "$file" SMTP_HOST "$host" SMTP_PORT "$port" SMTP_USER "$user" SMTP_PASS "$pass" SMTP_FROM "$user" REPORT_MAIL_TO "$REPORT_MAIL_TO_VALUE"
+  pass=''
+  say "wrote SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM and REPORT_MAIL_TO to $file (mode 600). Used after the restart."
+}
+
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 remote_test() {
   local stage=$1 p rc=0 name
   for p in $TEST_PORTS; do if port_busy "$p"; then say "port $p is in use on this server; the tests need $TEST_PORTS free. Not running them."; return 1; fi; done
+  command -v openssl >/dev/null || { say "the tests need openssl on this server (the fake SMTP server's certificate)."; return 1; }
   cd "$stage" && mkdir -p .test-logs
-  for name in e2e-fs s3 e2e-s3; do
+  for name in e2e-fs s3 mail e2e-s3; do
     case $name in
+      mail) node test/mail.mjs </dev/null >".test-logs/$name.log" 2>&1 ;;
       e2e-fs) SITE_DIR="$stage/.test-site" node test/e2e.mjs </dev/null >".test-logs/$name.log" 2>&1 ;;
       s3) node test/s3.mjs </dev/null >".test-logs/$name.log" 2>&1 ;;
       e2e-s3) SITE_DIR="$stage/.test-site" BLOB_STORE=s3 node test/e2e.mjs </dev/null >".test-logs/$name.log" 2>&1 ;;
@@ -238,6 +275,11 @@ remote_dryrun() {
   local app=$1 stage=$2 envf=$3 datadir=$4
   remote_bucket_check "$app" "$stage" "$envf" "$datadir" || return 1
   live_node "$app" "$envf" "$datadir" "$stage/scripts/migrate-blobs-to-s3.mjs" --dry-run
+}
+
+remote_mailtest() {
+  local app=$1 stage=$2 envf=$3 datadir=$4
+  live_node "$app" "$envf" "$datadir" "$stage/scripts/report-mail-test.mjs"
 }
 
 remote_golive() {
@@ -338,6 +380,7 @@ remote_main() {
     set-keys) remote_set_keys "$@" ;;
     test) remote_test "$@" ;;
     dryrun) remote_dryrun "$@" ;;
+    mailtest) remote_mailtest "$@" ;;
     golive) remote_golive "$@" ;;
     check-logs) remote_check_logs "$@" ;;
     *) say "unknown remote command $cmd"; return 2 ;;
@@ -406,6 +449,8 @@ local_main() {
   [ -n "$envf" ] || die "could not tell which env file pm2 loads. Look at how the app is started (above). If pm2 loads a file via an ecosystem file, rerun with --env-file <path>; if its env lives only in pm2, move it to a file loaded with node --env-file first."
   say "   env file:  $envf  (found from: $envsrc; mode $(get ENV_MODE), writable by the ssh user: $(get ENV_WRITABLE))"
   say "   in it now: BLOB_STORE=$(get FILE_BLOB_STORE) · DATA_DIR=$(get FILE_DATA_DIR) · PORT=$(get FILE_PORT) · S3 settings present: $(get FILE_S3_SET)"
+  if [ -n "$(get FILE_SMTP_HOST)" ]; then say "   report email: $(get FILE_SMTP_HOST):$(get FILE_SMTP_PORT) as $(get FILE_SMTP_USER) to $(get FILE_REPORT_MAIL_TO) (names present: $(get FILE_SMTP_SET))"
+  else say "   report email: off (no SMTP_HOST in the env file); step 4 offers to set it up"; fi
   say "   ALLOWED_ORIGINS: file '$(get FILE_ALLOWED_ORIGINS)' · pm2 '$(get PM2_ALLOWED_ORIGINS)'"
   [ "$(get CWD_HAS_SERVER)" = yes ] || die "$cwd has no src/server.js: is that really the bdrivex-api checkout?"
   [ "$(get ENV_WRITABLE)" = yes ] || die "the ssh user can't write $envf"
@@ -460,6 +505,10 @@ local_main() {
   # ---- 6. bucket check and dry run
   say ""; say "== 6. bucket check and migration dry run (live data, read-only except the probe object)"
   remote dryrun "$cwd" "$stage" "$envf" "$datadir" || die "the bucket check or dry run failed; nothing switched"
+  if ssh -n -o BatchMode=yes "$HOST" "grep -qE '^(export )?SMTP_HOST=.+' $(q "$envf")"; then
+    local mt; read -r -p "Send one test email (subject 'Report: test from bdrivex-api') to $REPORT_MAIL_TO_VALUE now? [y/N] " mt
+    if [ "$mt" = y ] || [ "$mt" = Y ]; then remote mailtest "$cwd" "$stage" "$envf" "$datadir" || say "   the test email failed (above). Going live still works; reports are then only logged until SMTP is fixed."; fi
+  fi
 
   # ---- 7. go live
   local rollback="ssh $HOST 'cp -p $envf.bak-$ts $envf && rsync -a $cwd.code-bak-$ts/ $cwd/ && pm2 restart $pmid'"

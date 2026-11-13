@@ -60,6 +60,7 @@ import { createChallenge, signSession, verifySession, verifySignIn } from '@bwal
 import { openDb } from './db.js';
 import { blobStoreFromEnv, BlobMissing } from './blobstore.js';
 import { keyHash, hashIp } from './admin.js';
+import { smtpConfigFromEnv, createReportMailer } from './mail.js';
 
 const env = process.env;
 const PROD = env.NODE_ENV === 'production';
@@ -108,6 +109,16 @@ const REPORT_IP_HASH_MS = Number(env.REPORT_IP_HASH_DAYS || 30) * DAY;
 const LINK_SCRUB_MS = Number(env.LINK_SCRUB_DAYS || 7) * DAY;
 const HOUSEKEEPING_MS = Number(env.HOUSEKEEPING_MS || 3600_000);
 const SUPPORT = 'support@bwalletx.com';
+// Report emails to support@bwalletx.com (src/mail.js). No SMTP_HOST: off, the REPORT log line is the only notice.
+// A half-done SMTP setting is logged and mail stays off; it never stops the API starting.
+let smtp = null;
+try { smtp = smtpConfigFromEnv(env); } catch (e) { console.error(`[bdrivex] report mail OFF: ${e.message}`); }
+const mailer = createReportMailer({
+  cfg: smtp,
+  perHour: Number(env.REPORT_MAIL_PER_HOUR || 30),
+  windowMs: Number(env.REPORT_MAIL_WINDOW_MS || 3600_000),
+  retryMs: Number(env.REPORT_MAIL_RETRY_MS || 60_000),
+});
 
 let SECRET = env.SESSION_SECRET || '';
 if (SECRET.length < 32) {
@@ -644,9 +655,12 @@ route('POST', /^\/v1\/s\/([\w-]+)\/report$/, async (req, _o, [id]) => {
   const t = now();
   const fresh = S.reports.add.run(id, t, String(reason || '').slice(0, 500), ip(req), l.owner, l.hash).changes > 0;
   if (fresh && !S.holds.active.get(l.owner, l.hash)) S.holds.place.run(l.owner, l.hash, id, t, 'report');
-  // Notification: bdrivex-api has no mail sender, so this line in the pm2 log is the notice. Grep for "REPORT".
-  // TODO: send this to support@bwalletx.com once there is a mail or notify service on the server (not added here).
-  if (fresh) console.warn(`[bdrivex] REPORT link ${id} switched off, file held (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…, ${new Date(t).toISOString()}). For ${SUPPORT}: review with scripts/legal-hold.mjs list`);
+  // Notice: this line in the pm2 log (grep REPORT), and an email to support@ (queued in the background: a mail problem
+  // never slows or fails this request). The email carries only link ID, hash prefix, reason and time.
+  if (fresh) {
+    console.warn(`[bdrivex] REPORT link ${id} switched off, file held (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…, ${new Date(t).toISOString()}). For ${SUPPORT}: review with scripts/legal-hold.mjs list`);
+    mailer.report({ linkId: id, hash: l.hash, reason, at: t });
+  }
   return [204, null];
 }, { public: true });
 
@@ -689,7 +703,7 @@ const server = createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 0; // big chunks on slow links; headersTimeout still applies
-server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · blobs ${blobs.describe()} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
+server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · blobs ${blobs.describe()} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING} · ${mailer.describe()}`));
 
 setInterval(() => retryBlobDeletes().catch((e) => console.error('[bdrivex] blob delete retry', e)), BLOB_DELETE_RETRY_MS).unref();
 

@@ -18,6 +18,7 @@ const { parseRecipient } = await import(join(SITE, 'js/paymail.js'));
 const { DatabaseSync } = await import('node:sqlite');
 const { startFakeS3 } = await import('./fake-s3.mjs');
 const { keyHash } = await import('../src/admin.js');
+const { startFakeSmtp } = await import('./fake-smtp.mjs');
 
 // Where blobs go: the fs store (default) or, with BLOB_STORE=s3, a fake S3 bucket here, one prefix per server's data dir.
 const S3 = process.env.BLOB_STORE === 's3';
@@ -685,6 +686,64 @@ const startServer = async (port, dir, extra = {}) => {
   const s401 = await fetch(B6 + '/v1/files');
   ok(s401.status === 401 && (await s401.json()).code === 'signin_required', 'no session: 401 signin_required');
   s6.kill(); rmSync(d6, { recursive: true, force: true });
+}
+
+// ---- report emails to support@: never in the way of the report, only four facts, capped per hour
+{
+  console.log('report emails');
+  const smtp = await startFakeSmtp({ mode: 'tls', users: { 'support@bwalletx.com': 'test-smtp-pass' } });
+  const P7 = 8793, B7 = `http://127.0.0.1:${P7}`, d7 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const s7 = await startServer(P7, d7, { SIGNUP: 'open', SHARING: 'open', SMTP_HOST: '127.0.0.1', SMTP_PORT: String(smtp.port), SMTP_SECURE: '1',
+    SMTP_USER: 'support@bwalletx.com', SMTP_PASS: 'test-smtp-pass', SMTP_CA_FILE: smtp.caFile, SMTP_TLS_SERVERNAME: 'localhost',
+    REPORT_MAIL_PER_HOUR: '2', REPORT_MAIL_WINDOW_MS: '1500', REPORT_MAIL_RETRY_MS: '200' });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms = 6000) => { for (let i = 0; i < ms / 100 && !fn(); i++) await sleep(100); return fn(); };
+  const mw = new ProtoWallet(PrivateKey.fromRandom()), mk = (await mw.getPublicKey({ identityKey: true })).publicKey;
+  const c = await (await fetch(B7 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: mk }) })).json();
+  const { signature } = await mw.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
+  const MT = (await (await fetch(B7 + '/v1/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: mk, nonce: c.nonce, signature: Array.from(signature) }) })).json()).token;
+  const plain = Buffer.from('TOP SECRET PLAINTEXT ' + 'x'.repeat(3000));
+  const mf = await uploadFile({ base: B7, token: MT, source: { size: plain.length, read: async (a, b) => new Uint8Array(plain.subarray(a, b)) }, name: 'private-name.pdf', type: 'application/pdf' });
+  const M = api(B7, MT);
+  const links = [];
+  for (let i = 0; i < 5; i++) links.push((await M.post('/v1/links', { hash: mf.hash })).id);
+  const report = (id, reason) => fetch(`${B7}/v1/s/${id}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason }) });
+
+  smtp.down(true); // the mail server is unreachable when the report comes in
+  const t0 = Date.now();
+  const r1 = await report(links[0], 'illegal content\nTime: forged');
+  ok(r1.status === 204 && Date.now() - t0 < 1000, `with the mail server down the report still answers 204 at once (${Date.now() - t0} ms)`);
+  await sleep(500);
+  ok(smtp.messages.length === 0, 'and nothing was delivered yet');
+  smtp.down(false);
+  await until(() => smtp.messages.length === 1);
+  const m1 = smtp.messages[0];
+  ok(m1 && m1.secure && m1.auth === 'support@bwalletx.com' && m1.to.join() === 'support@bwalletx.com', 'once it is back, the retry delivers one email to support@bwalletx.com over TLS');
+  ok(m1?.subject === `Report: link ${links[0]} (file ${mf.hash.slice(0, 12)})`, `subject starts "Report:": ${m1?.subject}`);
+  const lines = (m1?.text || '').replace(/\r\n/g, '\n').trim().split('\n');
+  ok(lines.length === 4 && lines[0] === `Link: ${links[0]}` && lines[1] === `File: ${mf.hash.slice(0, 12)}` && lines[2] === 'Reason: illegal content Time: forged' && /^Time: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(lines[3]),
+    'body is exactly: link ID, 12-hex file prefix, reason (one line), UTC ISO time');
+  const all = (m1?.raw || '') + (m1?.text || '');
+  const meta = (await M.get('/v1/files')).files[0].meta;
+  ok(!all.includes(mf.hash) && !all.includes(mk) && !all.includes(meta.slice(0, 40)) && !all.includes('private-name') && !all.includes('TOP SECRET') && !/127\.0\.0\.1|::1|::ffff/.test(all) && !all.includes(mf.key),
+    'no full hash, no identity key, no meta, no file name or content, no reporter IP, no file key');
+
+  await sleep(1600); // a fresh window
+  const before = smtp.messages.length;
+  for (const id of links.slice(1)) ok((await report(id, 'spam')).status === 204, `report ${id.slice(0, 6)}… answered 204`);
+  await until(() => smtp.messages.length === before + 2);
+  await sleep(300);
+  ok(smtp.messages.length === before + 2, '4 reports with a cap of 2 per window: 2 emails');
+  await until(() => smtp.messages.length === before + 3, 6000);
+  ok(/^Report: 2 more reports not mailed one by one$/.test(smtp.messages.at(-1)?.subject || ''), `then one summary: ${smtp.messages.at(-1)?.subject}`);
+  s7.kill(); rmSync(d7, { recursive: true, force: true });
+
+  // a half-done SMTP setting leaves mail off and the API up
+  const P8 = 8792, d8 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const s8 = await startServer(P8, d8, { SMTP_HOST: '127.0.0.1', SMTP_USER: 'support@bwalletx.com' });
+  ok((await fetch(`http://127.0.0.1:${P8}/health`)).status === 200, 'SMTP_HOST without SMTP_PASS: mail off (logged), the API still starts');
+  s8.kill(); rmSync(d8, { recursive: true, force: true });
+  await smtp.close();
 }
 
 // ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working
