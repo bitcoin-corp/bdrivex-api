@@ -246,9 +246,15 @@ async function store(tmp, hash) {
   catch (e) { console.error('[bdrivex] blob store put failed', hash.slice(0, 12), e.message); fail(503, STORE_DOWN, { 'retry-after': '60' }); }
 }
 
-/** Call inside oneAtATime(hash). Deletes the blob if no file row holds it; a failed delete is recorded and retried. */
-async function unlinkIfOrphan(hash) {
+/**
+ * Call inside oneAtATime(hash). Deletes the blob if no file row holds it; a failed delete is recorded and retried.
+ * `reason` (e.g. 'user delete') writes the deletion log (erased_blobs) in the same step, whether the store delete
+ * succeeds now or is left to the retry: that log is what lets the B2 mirror prune the backup copy. The retry passes no
+ * reason, as the row was written at the first attempt.
+ */
+async function unlinkIfOrphan(hash, reason = null) {
   if (S.files.refs.get(hash).n !== 0) { S.blobDeletes.done.run(hash); return; }
+  if (reason) S.erased.add.run(hash, now(), reason);
   // The file row is gone already, so the user's delete has happened: don't fail it. Record the blob for the retry.
   try { await blobs.del(hash); S.blobDeletes.done.run(hash); }
   catch (e) {
@@ -422,6 +428,7 @@ route('POST', /^\/v1\/uploads\/([\w-]+)\/complete$/, async (req, owner, [id]) =>
     await oneAtATime(got, async () => {
       await store(tmpPath(id), got);
       S.files.add.run(owner, got, u.size, meta ?? null, now());
+      S.erased.clear.run(got); // live again: never prune it from the backup
     });
     S.uploads.del.run(id);
     return [200, { hash: got, size: u.size }];
@@ -457,6 +464,7 @@ route('PUT', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
     await oneAtATime(hash, async () => {
       await store(tmp, hash);
       S.files.add.run(owner, hash, len, req.headers['x-bdx-meta'] || null, now());
+      S.erased.clear.run(hash); // live again: never prune it from the backup
     });
   } finally { await rm(tmp, { force: true }); } // nothing to resume for a single PUT
   return [201, { hash, size: len }];
@@ -497,7 +505,7 @@ route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
   if (!S.files.get.get(owner, hash)) fail(404, 'No such file.');
   await oneAtATime(hash, async () => {
     S.files.del.run(owner, hash); // its links go with it (ON DELETE CASCADE)
-    await unlinkIfOrphan(hash);
+    await unlinkIfOrphan(hash, 'user delete');
   });
   return [204, null];
 }, { auth: true });
