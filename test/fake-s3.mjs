@@ -21,7 +21,8 @@ export async function startFakeS3({ root, region = 'fsn1', credentials, buckets 
   for (const b of buckets) mkdirSync(join(root, b), { recursive: true });
   const requests = [];      // { method, bucket, key, query, signedHeaders, authorization }
   const authFailures = [];  // reasons
-  const failures = [];      // injected: { method, status, times }
+  const failures = [];      // injected: { method, status, times, bucket? }
+  const brokenListings = new Set(); // buckets whose listing says "truncated" but gives no continuation token
 
   const reply = (res, status, code, message, extra = {}) => {
     const body = code ? `<?xml version="1.0" encoding="UTF-8"?><Error><Code>${code}</Code><Message>${xml(message)}</Message></Error>` : '';
@@ -64,7 +65,7 @@ export async function startFakeS3({ root, region = 'fsn1', credentials, buckets 
       const why = checkAuth(req, url);
       requests.push({ method: req.method, bucket: decodeURIComponent(bucket), key, query: Object.fromEntries(url.searchParams), range: req.headers.range, authorization: req.headers.authorization });
       if (why) { authFailures.push(`${req.method} ${url.pathname}: ${why}`); req.resume(); return reply(res, 403, 'SignatureDoesNotMatch', why); }
-      const f = failures.find((x) => x.method === req.method && x.times > 0);
+      const f = failures.find((x) => x.method === req.method && x.times > 0 && (!x.bucket || x.bucket === decodeURIComponent(bucket)));
       if (f) { f.times--; req.resume(); return reply(res, f.status, 'InjectedFailure', 'injected by the test'); }
       const bdir = join(root, decodeURIComponent(bucket));
       try { statSync(bdir); } catch { req.resume(); return reply(res, 404, 'NoSuchBucket', 'no such bucket'); }
@@ -78,10 +79,10 @@ export async function startFakeS3({ root, region = 'fsn1', credentials, buckets 
         const after = url.searchParams.get('continuation-token') ? Buffer.from(url.searchParams.get('continuation-token'), 'base64url').toString() : '';
         const all = listKeys(bdir).filter((k) => k.startsWith(prefix) && k > after);
         const page = all.slice(0, max);
-        const truncated = all.length > max;
+        const truncated = all.length > max || brokenListings.has(decodeURIComponent(bucket));
         const body = `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>${xml(bucket)}</Name><Prefix>${xml(prefix)}</Prefix><KeyCount>${page.length}</KeyCount><MaxKeys>${max}</MaxKeys><IsTruncated>${truncated}</IsTruncated>`
-          + page.map((k) => `<Contents><Key>${xml(k)}</Key><Size>${statSync(join(bdir, ...k.split('/'))).size}</Size><StorageClass>STANDARD</StorageClass></Contents>`).join('')
-          + (truncated ? `<NextContinuationToken>${Buffer.from(page.at(-1)).toString('base64url')}</NextContinuationToken>` : '') + '</ListBucketResult>';
+          + page.map((k) => `<Contents><Key>${xml(k)}</Key><LastModified>${statSync(join(bdir, ...k.split('/'))).mtime.toISOString()}</LastModified><Size>${statSync(join(bdir, ...k.split('/'))).size}</Size><StorageClass>STANDARD</StorageClass></Contents>`).join('')
+          + (truncated && !brokenListings.has(decodeURIComponent(bucket)) ? `<NextContinuationToken>${Buffer.from(page.at(-1)).toString('base64url')}</NextContinuationToken>` : '') + '</ListBucketResult>';
         res.writeHead(200, { 'content-type': 'application/xml', 'content-length': Buffer.byteLength(body) });
         return res.end(body);
       }
@@ -141,8 +142,10 @@ export async function startFakeS3({ root, region = 'fsn1', credentials, buckets 
     port,
     requests,
     authFailures,
-    /** The next `times` requests with this method get `status`. */
-    failNext(method, status = 503, times = 1) { failures.push({ method, status, times }); },
+    /** The next `times` requests with this method (to this bucket, if given) get `status`. */
+    failNext(method, status = 503, times = 1, bucket = null) { failures.push({ method, status, times, bucket }); },
+    /** Make a bucket's listing claim to be truncated without giving a continuation token (or put it right). */
+    breakListing(bucket, broken = true) { if (broken) brokenListings.add(bucket); else brokenListings.delete(bucket); },
     clearFailures() { failures.length = 0; },
     objectPath: (bucket, key) => join(root, bucket, ...key.split('/')),
     close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(r); }),

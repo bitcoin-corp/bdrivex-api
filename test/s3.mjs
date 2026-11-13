@@ -3,13 +3,15 @@
 //   node test/s3.mjs
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { signV4, createS3Client, s3ConfigFromEnv, EMPTY_SHA256 } from '../src/s3.js';
 import { s3Store, fsStore, BlobMissing, blobStoreFromEnv } from '../src/blobstore.js';
+import { openDb } from '../src/db.js';
+import { DatabaseSync as DatabaseSyncRO } from 'node:sqlite';
 import { startFakeS3 } from './fake-s3.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -202,6 +204,96 @@ const r5 = await run('mirror-to-b2.mjs', [], MENV);
 ok(r5.code === 1 && /size mismatches 1/.test(r5.out) && readFileSync(fake.objectPath('b2', `m/${local[2].h}`)).toString() === 'short', 'a B2 copy of the wrong size is reported (exit 1) and not overwritten');
 const r6 = await run('mirror-to-b2.mjs', [], { ...S3ENV });
 ok(r6.code === 2 && /B2_ENDPOINT/.test(r6.out), 'missing B2 settings: exit 2');
+
+console.log('mirror-to-b2 --prune');
+writeFileSync(fake.objectPath('b2', `m/${local[2].h}`), local[2].b); // put the short copy right again
+writeFileSync(join(root, 'b2', 'm', 'notes.txt'), 'not a blob');
+const b2Files = () => readdirSync(join(root, 'b2', 'm')).sort().join(',');
+const last = (r) => r.out.trim().split('\n').at(-1);
+// B2 now: the 5 primary blobs, plus goneH (no longer in the primary) and notes.txt (not a blob)
+ok(existsSync(fake.objectPath('b2', `m/${goneH}`)), 'before: B2 still has a blob the primary no longer has (mirroring without --prune never deletes)');
+const p0 = await run('mirror-to-b2.mjs', ['--prune', '--dry-run'], MENV);
+ok(p0.code === 0 && p0.out.includes(`would delete b2/m/${goneH}`) && /prune dry run: would delete 1/.test(p0.out) && existsSync(fake.objectPath('b2', `m/${goneH}`)), `--prune --dry-run deletes nothing: ${last(p0)}`);
+fake.requests.length = 0;
+const p1 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+ok(p1.code === 0 && p1.out.includes(`deleted b2/m/${goneH}`) && /prune done: deleted 1, failed 0/.test(p1.out), `--prune deletes from B2 what the primary no longer has, and logs the key: ${last(p1)}`);
+ok(!existsSync(fake.objectPath('b2', `m/${goneH}`)) && existsSync(join(root, 'b2', 'm', 'notes.txt')) && local.every(({ h }) => existsSync(fake.objectPath('b2', `m/${h}`))), 'only that blob went: the primary\'s blobs and the non-blob key stay');
+ok(fake.requests.filter((r) => r.method === 'DELETE').every((r) => r.bucket === 'b2'), 'deletes go only to B2, never to the primary');
+// two blobs deleted from the primary (2 of B2's 5 blobs = 40%)
+rmSync(fake.objectPath('other', `m/${local[1].h}`)); rmSync(fake.objectPath('other', `m/${local[3].h}`));
+let snap = b2Files();
+const p2 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0'], MENV);
+ok(p2.code === 1 && /prune refused: it would delete 2 of 5/.test(p2.out) && b2Files() === snap, `more than 10% refused (exit 1), nothing deleted: ${last(p2)}`);
+const p3 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0', '--force', '--dry-run'], MENV);
+ok(p3.code === 0 && /would delete 2/.test(p3.out) && b2Files() === snap, '--force lets it through (here a dry run)');
+const p4 = await run('mirror-to-b2.mjs', ['--prune', '--max-delete-floor=0'], { ...MENV, S3_PREFIX: 'nothing/', B2_PREFIX: 'm/' });
+ok(p4.code === 1 && /primary listing .* is empty/.test(p4.out) && b2Files() === snap, `an empty primary listing (wrong prefix) is refused even under the share limit: ${last(p4)}`);
+const p4f = await run('mirror-to-b2.mjs', ['--prune', '--force'], { ...MENV, S3_PREFIX: 'nothing/', B2_PREFIX: 'm/' });
+ok(p4f.code === 1 && b2Files() === snap, 'and even with --force');
+fake.failNext('GET', 500, 1, 'other');
+const p5 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+ok(p5.code === 1 && /prune REFUSED \(listing failed\)/.test(p5.out) && b2Files() === snap, `a primary listing that fails: no prune (exit 1): ${last(p5)}`);
+fake.breakListing('other');
+const p6 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+fake.breakListing('other', false);
+ok(p6.code === 1 && /TruncatedListing/.test(p6.out) && /prune REFUSED/.test(p6.out) && b2Files() === snap, `a primary listing cut short (truncated, no token): no prune (exit 1): ${last(p6)}`);
+fake.breakListing('b2');
+const p6b = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+fake.breakListing('b2', false);
+ok(p6b.code === 1 && /prune REFUSED/.test(p6b.out) && b2Files() === snap, 'a B2 listing cut short: no prune either');
+const p7 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+ok(p7.code === 0 && /deleted 2, failed 0/.test(p7.out) && !existsSync(fake.objectPath('b2', `m/${local[1].h}`)) && !existsSync(fake.objectPath('b2', `m/${local[3].h}`)), `with the default floor (25 objects) a small bucket prunes normally: ${last(p7)}`);
+fake.failNext('DELETE', 503, 1, 'b2');
+rmSync(fake.objectPath('other', `m/${local[0].h}`));
+const p8 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+ok(p8.code === 1 && /deleted 0, failed 1/.test(p8.out) && existsSync(fake.objectPath('b2', `m/${local[0].h}`)), 'a B2 delete that fails: exit 1, tried again next night');
+const p9 = await run('mirror-to-b2.mjs', ['--prune'], MENV);
+ok(p9.code === 0 && /deleted 1, failed 0/.test(p9.out), 'and the next run deletes it');
+
+console.log('orphan-blobs');
+const od = mkdtempSync(join(tmpdir(), 'bdrivex-orphans-'));
+const OENV = { ...S3ENV, S3_PREFIX: 'o/', DATA_DIR: od };
+const oc = createS3Client({ ...cfg, bucket: 'other' });
+const mk = async () => { const b = randomBytes(500 + Math.floor(Math.random() * 500)), h = sha(b); await oc.put(`o/${h}`, { body: b, size: b.length, sha256: h }); return h; };
+const [held1, held2, orph1, orph2] = [await mk(), await mk(), await mk(), await mk()];
+await oc.put('o/notes.txt', { body: Buffer.from('x'), size: 1, sha256: sha('x') });
+const missH = sha(randomBytes(9));
+{
+  const S = openDb(join(od, 'bdrivex.db'));
+  const owner = '02' + 'a'.repeat(64);
+  for (const h of [held1, held2, missH]) S.files.add.run(owner, h, 1000, null, Date.now());
+  S.files.add.run('03' + 'b'.repeat(64), held1, 1000, null, Date.now()); // two wallets hold held1
+  S.blobDeletes.failed.run(orph1, Date.now(), 'S3 503: injected');
+  S.blobDeletes.failed.run(sha('a blob deleted by hand since'), Date.now(), 'gone already'); // a failed delete whose blob has since gone
+  S.db.close();
+}
+const o0 = await run('orphan-blobs.mjs', [], OENV);
+ok(o0.code === 0 && /orphans 0 \(younger than 24h skipped: 2\)/.test(o0.out) && o0.out.includes(`missing ${missH}: 1 file row(s)`) && /not blobs 1/.test(o0.out), `fresh blobs are never orphans (an upload stores its blob just before its row): ${last(o0)}`);
+const old = new Date(Date.now() - 2 * 86400e3);
+for (const h of [orph1, orph2]) utimesSync(fake.objectPath('other', `o/${h}`), old, old);
+const o1 = await run('orphan-blobs.mjs', [], OENV);
+ok(o1.code === 0 && o1.out.includes(`orphan o/${orph1}`) && o1.out.includes(`orphan o/${orph2}`) && /failed delete, 1 attempts/.test(o1.out) && /report only/.test(o1.out), `the report lists both orphans (one with its failed delete) and the row with no blob: ${last(o1)}`);
+ok([held1, held2, orph1, orph2].every((h) => existsSync(fake.objectPath('other', `o/${h}`))), 'reporting deletes nothing (the default is a dry run)');
+const o1b = await run('orphan-blobs.mjs', ['--delete', '--dry-run'], OENV);
+ok(o1b.code === 0 && existsSync(fake.objectPath('other', `o/${orph1}`)), '--delete --dry-run deletes nothing');
+const o2 = await run('orphan-blobs.mjs', ['--delete', '--max-delete-floor=0'], OENV);
+ok(o2.code === 1 && /--delete refused: 2 of 4 blobs/.test(o2.out) && existsSync(fake.objectPath('other', `o/${orph1}`)), `more than 10% of the bucket: refused (exit 1): ${last(o2)}`);
+const o3 = await run('orphan-blobs.mjs', ['--delete'], OENV);
+ok(o3.code === 0 && /deleted 2, failed 0/.test(o3.out) && !existsSync(fake.objectPath('other', `o/${orph1}`)) && !existsSync(fake.objectPath('other', `o/${orph2}`)), `--delete removes the orphans: ${last(o3)}`);
+ok(existsSync(fake.objectPath('other', `o/${held1}`)) && existsSync(fake.objectPath('other', `o/${held2}`)) && existsSync(fake.objectPath('other', 'o/notes.txt')), 'blobs that rows hold, and keys that are not blobs, stay');
+{
+  const d = new DatabaseSyncRO(join(od, 'bdrivex.db'));
+  ok(d.prepare('SELECT COUNT(*) AS n FROM blob_deletes').get().n === 0, 'the failed-delete rows are cleared (the deleted orphan, and one whose blob was already gone)');
+  d.close();
+}
+const o4d = mkdtempSync(join(tmpdir(), 'bdrivex-orphans-empty-'));
+openDb(join(o4d, 'bdrivex.db')).db.close();
+const o4 = await run('orphan-blobs.mjs', ['--delete', '--min-age-hours=0'], { ...OENV, DATA_DIR: o4d });
+ok(o4.code === 1 && /no file rows but the bucket has blobs/.test(o4.out) && existsSync(fake.objectPath('other', `o/${held1}`)), `an empty database (wrong DATA_DIR) refuses --delete: ${last(o4)}`);
+const o5 = await run('orphan-blobs.mjs', [], { ...OENV, DATA_DIR: join(od, 'nope') });
+ok(o5.code === 2 && /no database/.test(o5.out), 'no database: exit 2');
+oc.close();
+rmSync(od, { recursive: true, force: true }); rmSync(o4d, { recursive: true, force: true });
 ok(fake.authFailures.length === 0, `no request failed its signature check (${fake.authFailures.join('; ') || 'none'})`);
 
 c.close();

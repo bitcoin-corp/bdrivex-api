@@ -23,7 +23,7 @@ const S3 = process.env.BLOB_STORE === 's3';
 const s3root = S3 ? mkdtempSync(join(tmpdir(), 'bdrivex-fake-s3-')) : null;
 const s3fake = S3 ? await startFakeS3({ root: s3root, region: 'fsn1', credentials: { 'test-key-id': 'test-secret' }, buckets: ['bdrivex'] }) : null;
 const storeEnv = (dir) => S3
-  ? { BLOB_STORE: 's3', S3_ENDPOINT: s3fake.endpoint, S3_REGION: 'fsn1', S3_BUCKET: 'bdrivex', S3_ACCESS_KEY_ID: 'test-key-id', S3_SECRET_ACCESS_KEY: 'test-secret', S3_PREFIX: `${basename(dir)}/` }
+  ? { BLOB_STORE: 's3', S3_ENDPOINT: s3fake.endpoint, S3_REGION: 'fsn1', S3_BUCKET: 'bdrivex', S3_ACCESS_KEY_ID: 'test-key-id', S3_SECRET_ACCESS_KEY: 'test-secret', S3_PREFIX: `${basename(dir)}/`, BLOB_DELETE_RETRY_MS: '300' }
   : { BLOB_STORE: 'fs' };
 const blobFile = (dir, h) => S3 ? s3fake.objectPath('bdrivex', `${basename(dir)}/${h}`) : join(dir, 'blobs', h.slice(0, 2), h.slice(2, 4), h);
 const placeBlob = (dir, h, buf) => { mkdirSync(dirname(blobFile(dir, h)), { recursive: true }); writeFileSync(blobFile(dir, h), buf); };
@@ -255,6 +255,25 @@ if (S3) {
   ok(existsSync(blobFile(data, bh)), 'deleting one holder keeps the blob in the bucket');
   await api(BASE, st.token).del(`/v1/files/${bh}`);
   ok(!existsSync(blobFile(data, bh)), 'deleting the last holder removes it from the bucket');
+  // the bucket refuses the delete: the user's delete still succeeds, the blob is recorded and the server retries it
+  const ob = randomBytes(3000), oh = sha(ob);
+  await api(BASE, T2).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  s3fake.failNext('DELETE', 503, 1);
+  const delRes = await fetch(`${BASE}/v1/files/${oh}`, { method: 'DELETE', headers: { authorization: `Bearer ${T2}` } });
+  const pendingRows = () => { const d = new DatabaseSync(join(data, 'bdrivex.db')); try { return d.prepare('SELECT hash, attempts FROM blob_deletes').all(); } finally { d.close(); } };
+  const rec = pendingRows();
+  ok(delRes.status === 204 && (await api(BASE, T2).get('/v1/files')).files.every((f) => f.hash !== oh), 's3 refuses a delete: the user\'s delete still succeeds');
+  ok(existsSync(blobFile(data, oh)) && rec.length === 1 && rec[0].hash === oh, 'the orphan blob is recorded in blob_deletes');
+  for (let i = 0; i < 50 && (existsSync(blobFile(data, oh)) || pendingRows().length); i++) await new Promise((r) => setTimeout(r, 100));
+  ok(!existsSync(blobFile(data, oh)) && pendingRows().length === 0, 'and the server retries it: blob gone, record cleared');
+  // a recorded blob that someone uploads again before the retry is kept, and its record dropped
+  await api(BASE, T2).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  s3fake.failNext('DELETE', 503, 1);
+  await api(BASE, T2).del(`/v1/files/${oh}`);
+  await api(BASE, st.token).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  for (let i = 0; i < 50 && pendingRows().length; i++) await new Promise((r) => setTimeout(r, 100));
+  ok(pendingRows().length === 0 && existsSync(blobFile(data, oh)) && readFileSync(blobFile(data, oh)).equals(ob), 'a recorded blob that was uploaded again before the retry is kept');
+  await api(BASE, st.token).del(`/v1/files/${oh}`);
 }
 
 // ---- invite-only mode: a second server that admits only the test wallet (and a second invited wallet, O2)
