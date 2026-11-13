@@ -9,6 +9,7 @@ pnpm dev                          # http://127.0.0.1:8787, data in ./data, dev o
                                   # (sharing is invite-only unless .env.local has SHARING=open or your key in ALLOWED_KEYS)
 pnpm test [file]                  # end to end with the site's client code (sign in, upload, resume, link, download)
 pnpm test:s3                      # S3 store, SigV4, migration, B2 mirror, orphans against a fake S3, then the e2e on it
+pnpm test:mail                    # report emails against a fake SMTP server (needs openssl for its certificate)
 node scripts/dev-session.mjs      # a throwaway-key session for testing /send without a wallet
 scripts/deploy-s3.sh              # from your Mac: move the live server onto Hetzner Object Storage (see Going live)
 ```
@@ -125,10 +126,33 @@ Owner decisions, Nov 2026: report records are kept 3 years; support email is kep
   (the report is about what was sent to whom); the first run after the hold is released scrubs it.
 - These run inside the API process every hour (`HOUSEKEEPING_MS`), and a minute after start, like the failed-delete
   retry, and log one `[bdrivex] retention:` line when they changed something.
-- **Notification.** There is no mail or notify service in this API, so a report writes one line to the pm2 log:
-  `[bdrivex] REPORT link <id> switched off, file held (owner …, file …, <time>). For support@bwalletx.com: …`. Watch for
-  it with `pm2 logs <app> | grep REPORT` or check `legal-hold.mjs list`. TODO (in `src/server.js`): send it to
-  support@bwalletx.com once the server has a mail or notify service; none was added here.
+- **Notification.** Every report writes one line to the pm2 log,
+  `[bdrivex] REPORT link <id> switched off, file held (owner …, file …, <time>). For support@bwalletx.com: …`, and
+  emails support@bwalletx.com (owner, Nov 2026: one mailbox, on Fasthosts; no separate reports address).
+
+## Report emails
+
+`src/mail.js` is a small SMTP client (`node:net`/`node:tls`, no dependency) and an in-process queue.
+
+- **What is sent.** Subject `Report: link <link id> (file <first 12 hex of the hash>)` (the mailbox's REPORTS filter
+  keys on `Report:`). Body, and nothing else: `Link: <id>`, `File: <12 hex>`, `Reason: <the reporter's reason, one
+  line, control characters blanked, 500 characters at most>`, `Time: <UTC ISO>`. Never file content, names or meta,
+  the full hash, the reporter's IP, an identity key or any file key. The body goes base64-encoded (UTF-8), so a reason
+  can't add headers.
+- **Never in the way.** The report answers 204 straight away; the email is queued in memory and sent in the
+  background, retried with backoff (1 min doubling, up to an hour, 8 tries), then dropped with a log line. A restart
+  drops unsent emails; the REPORT log line and `scripts/legal-hold.mjs list` still have every report.
+- **Capped.** At most `REPORT_MAIL_PER_HOUR` (30) emails an hour. Reports past that are counted, and when the hour
+  ends one summary goes out: `Report: <n> more reports not mailed one by one`, with counts and first/last times only.
+- **Settings** (in the env file; `scripts/deploy-s3.sh` asks for them, with the password typed hidden on the server,
+  and you can skip): `SMTP_HOST`, `SMTP_PORT` (465 = TLS from the start; anything else = STARTTLS, which is required:
+  the password is never sent unencrypted; `SMTP_SECURE=1` for TLS on another port), `SMTP_USER`, `SMTP_PASS`,
+  `SMTP_FROM` (default `SMTP_USER`), `REPORT_MAIL_TO` (default support@bwalletx.com). The server certificate is
+  checked against the system CAs. No `SMTP_HOST`: mail is off and reports are only logged. A half-done setting (host
+  without user or password, a bad address) is logged at start and mail stays off; the API still starts. The start line
+  says `report mail to … via host:port` or `report mail off`.
+- **Check it:** `cd <app dir> && node --env-file=<env file> scripts/report-mail-test.mjs` sends one
+  `Report: test from bdrivex-api` email (exit 0 sent, 1 failed, 2 not configured). The deploy script offers to run it.
 
 ## Closing an account
 
@@ -328,7 +352,9 @@ suites in the staging dir, checks the keys (list, write, read and delete a probe
 bucket (checked), back up the code it replaces (`<app dir>.code-bak-<time>`), copy the new code in, set
 `BLOB_STORE=s3` (and add the bstorex origins if `ALLOWED_ORIGINS` is set without them), `pm2 restart` (fork mode, 1
 instance), wait until `/health` answers and the new start line says `blobs s3`, copy any blob that arrived meanwhile,
-show the legal holds, and print a rollback command. The old `DATA_DIR/blobs` stays until you remove it by hand.
+show the legal holds, and print a rollback command. Step 4 also offers (skippable) to set up report emails: SMTP host
+(suggested `smtp.livemail.co.uk`, Fasthosts' outgoing server; check it), port, user (support@bwalletx.com) and the
+password, typed hidden on the server like the S3 keys; step 6 then offers to send one test email. The old `DATA_DIR/blobs` stays until you remove it by hand.
 
 ## BDX1 sealed format (for other clients)
 
