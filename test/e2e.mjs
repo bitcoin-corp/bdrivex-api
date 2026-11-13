@@ -1,9 +1,10 @@
 // End to end against a real server on a temp data dir, with the site's own client code:
 // sign in (throwaway key) -> upload -> link -> download as a stranger -> same SHA-256. Plus the failure cases.
 //   pnpm test [file]      (default: the APK for Jon if it's on the Desktop, else 24 MB of random bytes)
+//   BLOB_STORE=s3 pnpm test   the same, with every server storing blobs in a fake S3 bucket run in this process
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, openSync, readSync, readFileSync, writeFileSync, statSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, writeFileSync, statSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,16 +16,28 @@ const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api, saveKeyWr
 const { newSeal, sealSegment, sealMeta, importKey, b64u } = await import(join(SITE, 'js/bdx-crypto.js'));
 const { parseRecipient } = await import(join(SITE, 'js/paymail.js'));
 const { DatabaseSync } = await import('node:sqlite');
+const { startFakeS3 } = await import('./fake-s3.mjs');
+
+// Where blobs go: the fs store (default) or, with BLOB_STORE=s3, a fake S3 bucket here, one prefix per server's data dir.
+const S3 = process.env.BLOB_STORE === 's3';
+const s3root = S3 ? mkdtempSync(join(tmpdir(), 'bdrivex-fake-s3-')) : null;
+const s3fake = S3 ? await startFakeS3({ root: s3root, region: 'fsn1', credentials: { 'test-key-id': 'test-secret' }, buckets: ['bdrivex', 'b2mirror'] }) : null;
+const storeEnv = (dir) => S3
+  ? { BLOB_STORE: 's3', S3_ENDPOINT: s3fake.endpoint, S3_REGION: 'fsn1', S3_BUCKET: 'bdrivex', S3_ACCESS_KEY_ID: 'test-key-id', S3_SECRET_ACCESS_KEY: 'test-secret', S3_PREFIX: `${basename(dir)}/`, BLOB_DELETE_RETRY_MS: '300' }
+  : { BLOB_STORE: 'fs' };
+const blobFile = (dir, h) => S3 ? s3fake.objectPath('bdrivex', `${basename(dir)}/${h}`) : join(dir, 'blobs', h.slice(0, 2), h.slice(2, 4), h);
+const placeBlob = (dir, h, buf) => { mkdirSync(dirname(blobFile(dir, h)), { recursive: true }); writeFileSync(blobFile(dir, h), buf); };
+console.log(`blob store: ${S3 ? `s3 (fake, ${s3fake.endpoint})` : 'fs'}`);
 
 const PORT = 8799, BASE = `http://127.0.0.1:${PORT}`, ORIGIN = 'http://127.0.0.1:5173';
 const wallet = new ProtoWallet(PrivateKey.fromRandom());
 const { publicKey: identityKey } = await wallet.getPublicKey({ identityKey: true });
 const data = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
 const srv = spawn(process.execPath, [join(here, '../src/server.js')], {
-  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
+  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', SHARING: 'open', ...storeEnv(data), QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
-const stop = () => { srv.kill(); rmSync(data, { recursive: true, force: true }); };
+const stop = () => { srv.kill(); rmSync(data, { recursive: true, force: true }); if (s3root) rmSync(s3root, { recursive: true, force: true }); };
 process.on('exit', stop);
 for (let i = 0; ; i++) { try { await fetch(BASE + '/health'); break; } catch { if (i > 50) throw new Error('server did not start'); await new Promise((r) => setTimeout(r, 100)); } }
 
@@ -89,9 +102,9 @@ const t0 = Date.now();
 const up = await uploadFile({ base: BASE, token: T2, source, name: basename(path), type: 'application/vnd.android.package-archive', resume: saved });
 ok(HASH(up.hash) && up.key.length === 43, `resumed and completed in ${Date.now() - t0} ms · blob ${up.hash.slice(0, 16)}…`);
 function HASH(h) { return /^[0-9a-f]{64}$/.test(h); }
-const onDisk = readFileSync(join(data, 'blobs', up.hash.slice(0, 2), up.hash.slice(2, 4), up.hash));
-ok(sha(onDisk) === up.hash, 'blob on disk is stored under the sha256 of its bytes');
-ok(!onDisk.includes(readFileSync(path).subarray(4096, 4160)), 'blob on disk does not contain the plaintext');
+const onDisk = readFileSync(blobFile(data, up.hash));
+ok(sha(onDisk) === up.hash, `stored blob (${S3 ? 'in the bucket' : 'on disk'}) is under the sha256 of its bytes`);
+ok(!onDisk.includes(readFileSync(path).subarray(4096, 4160)), 'the stored blob does not contain the plaintext');
 ok(!onDisk.includes(Buffer.from(basename(path))), 'nor the file name');
 
 // ---- link and download as someone with no wallet
@@ -126,7 +139,7 @@ ok(cut && got2.sha256 === want, 'download picked up again after a dropped connec
 await rejects(openLink({ base: BASE, id: link.id, key: 'A'.repeat(43) }), /key/i, 'wrong key is caught');
 
 // ---- tampering: flip a byte in the stored blob
-const blob = join(data, 'blobs', up.hash.slice(0, 2), up.hash.slice(2, 4), up.hash);
+const blob = blobFile(data, up.hash);
 const orig = readFileSync(blob);
 const evil = Buffer.from(orig); evil[orig.length >> 1] ^= 1; writeFileSync(blob, evil);
 await rejects(downloadLink({ base: BASE, id: link.id, link: info, sink: { write() {} } }), /decrypt/i, 'a changed byte on the server is caught');
@@ -180,6 +193,27 @@ ok(put.status === 201, 'PUT /v1/blobs/:sha256 stores a small blob');
 await rejects(api(BASE, T2).call('PUT', `/v1/blobs/${'1'.repeat(64)}`, { body: photo }), /^422/, 'PUT with a body that does not match its hash is refused');
 const back = Buffer.from(await (await api(BASE, T2).call('GET', `/v1/blobs/${ph}`, { headers: { range: 'bytes=100-199' } })).arrayBuffer());
 ok(back.equals(photo.subarray(100, 200)), 'GET /v1/blobs/:sha256 serves Range reads to the owner');
+{
+  // Range details, the same whichever store is behind it
+  const g = (range, method = 'GET') => fetch(`${BASE}/v1/blobs/${ph}`, { method, headers: { authorization: `Bearer ${T2}`, ...(range ? { range } : {}) } });
+  const n = photo.length;
+  let r = await g('bytes=100-199');
+  ok(r.status === 206 && r.headers.get('content-range') === `bytes 100-199/${n}` && r.headers.get('content-length') === '100', 'a range: 206, Content-Range and Content-Length');
+  await r.arrayBuffer();
+  r = await g(`bytes=${n - 50}-`);
+  ok(r.status === 206 && Buffer.from(await r.arrayBuffer()).equals(photo.subarray(n - 50)) && r.headers.get('content-range') === `bytes ${n - 50}-${n - 1}/${n}`, 'an open-ended range');
+  r = await g('bytes=-10');
+  ok(r.status === 206 && Buffer.from(await r.arrayBuffer()).equals(photo.subarray(n - 10)), 'a suffix range (the last 10 bytes)');
+  r = await g(`bytes=${n - 5}-${n + 1000}`);
+  ok(r.status === 206 && r.headers.get('content-range') === `bytes ${n - 5}-${n - 1}/${n}` && (await r.arrayBuffer()).byteLength === 5, 'a range past the end is cut to the end');
+  r = await g(`bytes=${n}-`);
+  ok(r.status === 416 && r.headers.get('content-range') === `bytes */${n}`, 'a range starting past the end: 416, bytes */size');
+  await r.arrayBuffer();
+  r = await g(null);
+  ok(r.status === 200 && r.headers.get('accept-ranges') === 'bytes' && sha(Buffer.from(await r.arrayBuffer())) === ph, 'no range: 200, the whole blob, Accept-Ranges');
+  r = await g('bytes=0-9', 'HEAD');
+  ok(r.status === 206 && r.headers.get('content-length') === '10', 'HEAD with a range');
+}
 
 // ---- v1.1: the file key wrapped by the owner's wallet, kept beside the file
 console.log('wallet-wrapped keys');
@@ -203,11 +237,86 @@ await api(BASE, T2).del(`/v1/files/${up.hash}`);
 ok(!existsSync(blob), 'deleting a file removes its blob');
 await rejects(openLink({ base: BASE, id: short.id, key: up.key }), /^404/, 'and its links');
 ok(readdirSync(join(data, 'tmp')).length === 1, 'only the unfinished test upload is left in tmp');
+if (S3) {
+  ok(!existsSync(join(data, 'blobs')), 's3: no blob was ever written under DATA_DIR/blobs');
+  // the bucket is down when an upload finishes: 503, the upload and its staged bytes are kept, and finishing again works
+  const body = randomBytes(5000), bh = sha(body);
+  const u = await api(BASE, T2).post('/v1/uploads', { size: body.length });
+  await api(BASE, T2).call('PATCH', `/v1/uploads/${u.id}`, { body, headers: { 'content-type': 'application/offset+octet-stream', 'upload-offset': '0' } });
+  s3fake.failNext('PUT', 503, 3);
+  await rejects(api(BASE, T2).post(`/v1/uploads/${u.id}/complete`, { sha256: bh }), /^503 Storage is not answering/, 's3 down at /complete: 503');
+  ok((await api(BASE, T2).get(`/v1/uploads/${u.id}`)).offset === body.length && readdirSync(join(data, 'tmp')).includes(u.id), 'and the upload is kept, with its staged bytes');
+  const done = await api(BASE, T2).post(`/v1/uploads/${u.id}/complete`, { sha256: bh });
+  ok(done.hash === bh && readFileSync(blobFile(data, bh)).equals(body) && !readdirSync(join(data, 'tmp')).includes(u.id), 'finishing again uploads it to the bucket and clears the staged file');
+  // two wallets hold the same blob: deleting one copy keeps it, deleting the last removes it
+  const sp = await api(BASE, st.token).call('PUT', `/v1/blobs/${bh}`, { body });
+  ok(sp.status === 201 && (await api(BASE, st.token).get('/v1/files')).files.some((f) => f.hash === bh), 'a second wallet stores the same bytes (deduplicated)');
+  await api(BASE, T2).del(`/v1/files/${bh}`);
+  ok(existsSync(blobFile(data, bh)), 'deleting one holder keeps the blob in the bucket');
+  await api(BASE, st.token).del(`/v1/files/${bh}`);
+  ok(!existsSync(blobFile(data, bh)), 'deleting the last holder removes it from the bucket');
+  // the bucket refuses the delete: the user's delete still succeeds, the blob is recorded and the server retries it
+  const ob = randomBytes(3000), oh = sha(ob);
+  await api(BASE, T2).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  s3fake.failNext('DELETE', 503, 1);
+  const delRes = await fetch(`${BASE}/v1/files/${oh}`, { method: 'DELETE', headers: { authorization: `Bearer ${T2}` } });
+  const pendingRows = () => { const d = new DatabaseSync(join(data, 'bdrivex.db')); try { return d.prepare('SELECT hash, attempts FROM blob_deletes').all(); } finally { d.close(); } };
+  const rec = pendingRows();
+  ok(delRes.status === 204 && (await api(BASE, T2).get('/v1/files')).files.every((f) => f.hash !== oh), 's3 refuses a delete: the user\'s delete still succeeds');
+  ok(existsSync(blobFile(data, oh)) && rec.length === 1 && rec[0].hash === oh, 'the orphan blob is recorded in blob_deletes');
+  for (let i = 0; i < 50 && (existsSync(blobFile(data, oh)) || pendingRows().length); i++) await new Promise((r) => setTimeout(r, 100));
+  ok(!existsSync(blobFile(data, oh)) && pendingRows().length === 0, 'and the server retries it: blob gone, record cleared');
+  // a recorded blob that someone uploads again before the retry is kept, and its record dropped
+  await api(BASE, T2).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  s3fake.failNext('DELETE', 503, 1);
+  await api(BASE, T2).del(`/v1/files/${oh}`);
+  await api(BASE, st.token).call('PUT', `/v1/blobs/${oh}`, { body: ob });
+  for (let i = 0; i < 50 && pendingRows().length; i++) await new Promise((r) => setTimeout(r, 100));
+  ok(pendingRows().length === 0 && existsSync(blobFile(data, oh)) && readFileSync(blobFile(data, oh)).equals(ob), 'a recorded blob that was uploaded again before the retry is kept');
+  await api(BASE, st.token).del(`/v1/files/${oh}`);
+
+  // the deletion log, written by the server, and the B2 mirror pruning by it (and only by it)
+  const erased = (h) => { const d = new DatabaseSync(join(data, 'bdrivex.db')); try { return d.prepare('SELECT * FROM erased_blobs WHERE hash = ?').get(h); } finally { d.close(); } };
+  ok(erased(oh)?.reason === 'user delete', 'deleting the last holder writes the deletion log (erased_blobs, reason user delete)');
+  const mirror = (args) => new Promise((resolve) => {
+    const p = spawn(process.execPath, [join(here, '../scripts/mirror-to-b2.mjs'), ...args], {
+      env: { PATH: process.env.PATH, DATA_DIR: data, ...storeEnv(data), B2_ENDPOINT: s3fake.endpoint, B2_REGION: 'fsn1', B2_BUCKET: 'b2mirror', B2_ACCESS_KEY_ID: 'test-key-id', B2_SECRET_ACCESS_KEY: 'test-secret' },
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = ''; p.stdout.on('data', (d) => { out += d; }); p.stderr.on('data', (d) => { out += d; });
+    p.on('exit', (code) => resolve({ code, out, last: out.trim().split('\n').at(-1) }));
+  });
+  const inB2 = (h) => existsSync(s3fake.objectPath('b2mirror', `${basename(data)}/${h}`));
+  const put = async (b) => { const h = sha(b); await api(BASE, T2).call('PUT', `/v1/blobs/${h}`, { body: b }); return h; };
+  const [kb, rb, lb] = [randomBytes(4000), randomBytes(4100), randomBytes(4200)];
+  const [kh, rh, lh] = [await put(kb), await put(rb), await put(lb)];
+  const mm0 = await mirror(['--prune']);
+  ok(mm0.code === 0 && [kh, rh, lh].every(inB2), `mirror: the three new blobs are in B2: ${mm0.last}`);
+  // a user delete: pruned from B2
+  await api(BASE, T2).del(`/v1/files/${kh}`);
+  ok(erased(kh) && erased(kh).b2_pruned_at === null && !existsSync(blobFile(data, kh)), 'a user delete: blob gone from the primary, logged');
+  // delete then upload again: the log row is cleared, so it stays in B2
+  await api(BASE, T2).del(`/v1/files/${rh}`);
+  ok(erased(rh), 'deleted: logged');
+  await put(rb);
+  ok(!erased(rh), 'uploaded again: the log row is cleared');
+  // a loss on the primary side: the blob vanishes from the bucket, the file row stays
+  rmSync(blobFile(data, lh));
+  const mm1 = await mirror(['--prune']);
+  ok(!inB2(kh) && mm1.out.includes(`deleted b2mirror/${basename(data)}/${kh}`) && Number.isInteger(erased(kh).b2_pruned_at), `server + mirror: a user delete IS pruned from B2, and marked: ${mm1.last}`);
+  ok(inB2(rh) && existsSync(blobFile(data, rh)), 'delete then upload again is NOT pruned');
+  ok(inB2(lh) && mm1.code === 1 && mm1.out.includes(`LOST from the primary, restorable from B2: ${lh}`), 'a primary-side loss is NOT pruned, and the run flags it (exit 1)');
+  const mm2 = await mirror(['--restorable']);
+  ok(mm2.code === 0 && mm2.out.includes(lh) && /lost 1/.test(mm2.out), `--restorable lists it: ${mm2.last}`);
+  const mm3 = await mirror(['--restore']);
+  const back2 = Buffer.from(await (await api(BASE, T2).call('GET', `/v1/blobs/${lh}`)).arrayBuffer());
+  ok(mm3.code === 0 && back2.equals(lb), 'after --restore the owner downloads it again');
+  for (const h of [rh, lh]) await api(BASE, T2).del(`/v1/files/${h}`);
+}
 
 // ---- invite-only mode: a second server that admits only the test wallet (and a second invited wallet, O2)
 const startServer = async (port, dir, extra = {}) => {
   const p = spawn(process.execPath, [join(here, '../src/server.js')], {
-    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATA_DIR: dir, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ...extra },
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATA_DIR: dir, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ...storeEnv(dir), ...extra },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   for (let i = 0; ; i++) { try { await fetch(`http://127.0.0.1:${port}/health`); break; } catch { if (i > 50) throw new Error(`server on ${port} did not start`); await new Promise((r) => setTimeout(r, 100)); } }
@@ -357,6 +466,70 @@ const startServer = async (port, dir, extra = {}) => {
   s2.kill(); rmSync(d2, { recursive: true, force: true });
 }
 
+// ---- open sign-up, invite-only sharing: anyone stores files, only invited wallets make or bind links
+{
+  console.log('open sign-up, invite-only sharing');
+  const P4 = 8796, B4 = `http://127.0.0.1:${P4}`, d4 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const bogus = spawn(process.execPath, [join(here, '../src/server.js')], {
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(P4), DATA_DIR: d4, SESSION_SECRET: randomBytes(32).toString('hex'), SHARING: 'yes' }, stdio: 'ignore',
+  });
+  ok((await new Promise((r) => bogus.on('exit', r))) !== 0, 'SHARING must be open or invited (the server will not start otherwise)');
+  const s4 = await startServer(P4, d4, { SIGNUP: 'open', ALLOWED_KEYS: identityKey }); // SHARING not set: invited
+  const sign4 = async (w, k) => {
+    const c = await (await fetch(B4 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k }) })).json();
+    const { signature } = await w.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
+    return (await fetch(B4 + '/v1/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k, nonce: c.nonce, signature: Array.from(signature) }) })).json();
+  };
+  const small = (n, name, t) => { const b = randomBytes(n); return uploadFile({ base: B4, token: t, source: { size: n, read: async (a, z) => new Uint8Array(b.subarray(a, z)) }, name }).then((u) => ({ ...u, body: b })); };
+  const IT = (await sign4(wallet, identityKey)).token;
+  const nw = new ProtoWallet(PrivateKey.fromRandom()), nk = (await nw.getPublicKey({ identityKey: true })).publicKey; // signs up, not invited
+  const ns = await sign4(nw, nk);
+  ok(ns.token && ns.scope === 'full', 'with SIGNUP=open a wallet that is not invited signs up with a full session');
+  const N = api(B4, ns.token);
+  const nf = await small(70_000, 'mine.bin', ns.token);
+  ok(HASH(nf.hash) && (await N.get('/v1/files')).files.length === 1 && (await N.get('/v1/me')).usage.files === 1, 'its storage works: upload, list, usage');
+  const nb = Buffer.from(await (await N.call('GET', `/v1/blobs/${nf.hash}`)).arrayBuffer());
+  ok(sha(nb) === nf.hash, 'and it reads its own blob back');
+
+  const SHUT = { error: 'sharing_invite_only', message: 'Sharing links are invite-only for now. Your storage works as normal.' };
+  const raw = await fetch(B4 + '/v1/links', { method: 'POST', headers: { authorization: `Bearer ${ns.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ hash: nf.hash }) });
+  ok(raw.status === 403 && JSON.stringify(await raw.json()) === JSON.stringify(SHUT), 'POST /v1/links: 403 { error: sharing_invite_only, message }');
+  await rejects(N.post('/v1/links', { hash: nf.hash, recipient: identityKey }), /^403 Sharing links are invite-only for now\. Your storage works as normal\.$/, 'a link for one person too (and the site client shows the message)');
+  await rejects(makeLink({ base: B4, token: ns.token, site: 'https://bdrivex.com', hash: nf.hash, key: nf.key, recipient: identityKey, wallet: nw }), /^403 Sharing/, 'makeLink stops before asking the wallet to wrap anything');
+  const e403 = await N.post('/v1/links', { hash: nf.hash }).catch((e) => e);
+  ok(e403?.body?.error === 'sharing_invite_only', 'the client keeps the code on ApiError.body for the page to check');
+
+  // a link the new wallet already had (made while sharing was open) keeps working; it can't be bound, but can be switched off
+  const db4 = new DatabaseSync(join(d4, 'bdrivex.db'));
+  const oldId = randomBytes(16).toString('base64url');
+  db4.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(oldId, nk, nf.hash, Date.now(), Date.now() + 86400e3);
+  db4.close();
+  const oi = await openLink({ base: B4, id: oldId, key: nf.key });
+  const ps5 = [];
+  ok((await downloadLink({ base: B4, id: oldId, link: oi, sink: { write: (u8) => { ps5.push(u8); } } })).sha256 === sha(nf.body), 'an existing link still opens and downloads');
+  const bind = await fetch(`${B4}/v1/links/${oldId}/recipient`, { method: 'PUT', headers: { authorization: `Bearer ${ns.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ recipient: identityKey, recipientWrap: 'AAAA' }) });
+  ok(bind.status === 403 && (await bind.json()).error === 'sharing_invite_only', 'PUT /v1/links/:id/recipient is gated the same way');
+  ok((await N.get('/v1/files')).files[0].links.some((l) => l.id === oldId), 'the owner still sees it in the file list');
+  await N.del(`/v1/links/${oldId}`);
+  await rejects(openLink({ base: B4, id: oldId, key: nf.key }), /^404/, 'and can still switch it off');
+
+  // invited wallets share as before, and people they send to can open it
+  const ivf = await small(50_000, 'from-invited.bin', IT);
+  const any4 = await makeLink({ base: B4, token: IT, site: 'https://bdrivex.com', hash: ivf.hash, key: ivf.key });
+  ok(/#k=/.test(any4.url), 'an invited wallet still makes anyone-links');
+  const to4 = await makeLink({ base: B4, token: IT, site: 'https://bdrivex.com', hash: ivf.hash, key: ivf.key, recipient: nk, wallet });
+  const got4 = await openBoundLink({ base: B4, id: to4.id, token: ns.token, wallet: nw });
+  ok(to4.bound && got4.meta.name === 'from-invited.bin', 'and links for one person (POST + PUT), which the not-invited recipient opens');
+  await new Promise((r) => { s4.on('exit', r); s4.kill(); }); // free the port before the restart
+
+  // SHARING=open on the same data: the same wallet can now make links
+  const s4b = await startServer(P4, d4, { SIGNUP: 'open', SHARING: 'open', ALLOWED_KEYS: identityKey });
+  const ns2 = await sign4(nw, nk);
+  const opened4 = await api(B4, ns2.token).post('/v1/links', { hash: nf.hash });
+  ok(opened4.id && !opened4.bound, 'with SHARING=open any signed-in wallet makes links');
+  s4b.kill(); rmSync(d4, { recursive: true, force: true });
+}
+
 // ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working
 {
   console.log('migration from a v1.1 database');
@@ -377,9 +550,7 @@ const startServer = async (port, dir, extra = {}) => {
   const ck3 = await importKey(k3);
   const sealed = Buffer.concat([h3, await sealSegment(ck3, h3, 0, true, plain)]);
   const hh = sha(sealed);
-  const dir = join(d3, 'blobs', hh.slice(0, 2), hh.slice(2, 4));
-  (await import('node:fs')).mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, hh), sealed);
+  placeBlob(d3, hh, sealed);
   const lid = randomBytes(16).toString('base64url');
   old.prepare('INSERT INTO files (owner, hash, size, meta, created_at, key_wrap) VALUES (?, ?, ?, ?, ?, ?)').run(identityKey, hh, sealed.length, await sealMeta(ck3, h3, { name: 'old.bin', type: '', size: plain.length }), Date.now(), 'AAAA');
   old.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(lid, identityKey, hh, Date.now(), Date.now() + 86400e3);
@@ -402,6 +573,8 @@ const startServer = async (port, dir, extra = {}) => {
   s3b.kill(); rmSync(d3, { recursive: true, force: true });
 }
 
+if (S3) ok(s3fake.requests.some((r) => r.method === 'GET' && r.range === 'bytes=100-199'), 's3: a Range read is passed through to the bucket as a Range request');
+if (S3) ok(s3fake.authFailures.length === 0 && s3fake.requests.length > 0, `s3: ${s3fake.requests.length} requests to the fake bucket, every SigV4 signature checked and good${s3fake.authFailures.length ? ': ' + s3fake.authFailures.join('; ') : ''}`);
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');
 stop();
 process.exit(failures ? 1 : 0);
