@@ -259,15 +259,22 @@ remote_golive() {
   else write_env "$envf" BLOB_STORE s3; fi
   say "5/7 restarting pm2 app $pmid (fork mode, 1 instance)"
   pm2 restart "$pmid" </dev/null >/dev/null
-  for i in $(seq 1 30); do
-    if node -e 'fetch(process.argv[1]).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' "$health" </dev/null; then break; fi
+  # Healthy means: /health answers AND the newest start line in the pm2 log says "blobs s3" (so it is the new process
+  # with the new env answering, not an old one that never went away).
+  local ok=''
+  for i in $(seq 1 40); do
+    line=$(pm2 logs "$pmid" --nostream --lines 200 </dev/null 2>/dev/null | grep 'api on http' | tail -1 || true)
+    case $line in *"blobs s3 "*)
+      if node -e 'fetch(process.argv[1]).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' "$health" </dev/null; then ok=1; break; fi ;;
+    esac
     sleep 1
   done
-  node -e 'fetch(process.argv[1]).then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))' "$health" </dev/null \
-    || { say "HEALTH CHECK FAILED at $health. Roll back (command below)."; return 1; }
-  line=$(pm2 logs "$pmid" --nostream --lines 80 </dev/null 2>/dev/null | grep 'api on http' | tail -1 || true)
+  if [ -z "$ok" ]; then
+    say "HEALTH CHECK FAILED: after 40s the API at $health is not up on s3. Newest start line: ${line:-none}"
+    say "See: pm2 logs $pmid --lines 50. Roll back (command below)."
+    return 1
+  fi
   say "6/7 healthy at $health · ${line#*\[bdrivex\] }"
-  case $line in *"blobs s3 "*) ;; *) say "WARNING: the newest start line does not say 'blobs s3'. Check: pm2 logs $pmid" ;; esac
   say "7/7 copying blobs that arrived during the switch"
   live_node "$app" "$envf" "$datadir" "$stage/scripts/migrate-blobs-to-s3.mjs" || say "WARNING: the second migration pass failed; run it again (command below)."
   say "legal holds now on record (reports from before holds existed are held too):"
