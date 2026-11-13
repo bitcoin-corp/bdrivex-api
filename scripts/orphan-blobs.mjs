@@ -9,6 +9,9 @@
 // Env: DATA_DIR (the database is DATA_DIR/bdrivex.db), S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID,
 // S3_SECRET_ACCESS_KEY, S3_PREFIX. For BLOB_STORE=s3 only.
 //
+// --delete is the only path that deletes from the primary without a user's action. It never touches the B2 backup and
+// writes no deletion-log (erased_blobs) rows, so what it removes stays in B2 (the mirror calls it "unreferenced").
+//
 // Safety:
 //   - Only keys that are <S3_PREFIX><sha256> are considered; anything else in the bucket is listed and left alone.
 //   - Objects newer than --min-age-hours (default 24) are never orphans: an upload stores its blob a moment before
