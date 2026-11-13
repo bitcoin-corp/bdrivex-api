@@ -166,15 +166,23 @@ export function createS3Client({ endpoint, region, bucket, accessKeyId, secretAc
       if (res.statusCode === 204 || res.statusCode === 200 || res.statusCode === 404) { res.resume(); return; }
       await failWith(res, `DELETE ${key}`);
     },
-    /** Every object under `prefix`, as { key, size }, page by page (ListObjectsV2). */
+    /**
+     * Every object under `prefix`, as { key, size, lastModified (ms) }, page by page (ListObjectsV2). Throws if a page
+     * says there is more but gives no continuation token, so a caller never mistakes a cut-short listing for the lot.
+     */
     async *list(prefix = '', { pageSize = 1000 } = {}) {
       let token = null;
       do {
         const res = await request('GET', '', { query: { 'list-type': 2, prefix, 'max-keys': pageSize, 'continuation-token': token } });
         if (res.statusCode !== 200) await failWith(res, `LIST ${prefix}`);
         const xml = await readAll(res, 64 << 20);
-        for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) yield { key: tag(m[1], 'Key'), size: Number(tag(m[1], 'Size')) };
-        token = tag(xml, 'IsTruncated') === 'true' ? tag(xml, 'NextContinuationToken') : null;
+        for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+          const lm = tag(m[1], 'LastModified');
+          yield { key: tag(m[1], 'Key'), size: Number(tag(m[1], 'Size')), lastModified: lm ? Date.parse(lm) : null };
+        }
+        const truncated = tag(xml, 'IsTruncated') === 'true';
+        token = truncated ? tag(xml, 'NextContinuationToken') : null;
+        if (truncated && !token) throw new S3Error(502, 'TruncatedListing', `LIST ${prefix}: the listing is cut short and gives no continuation token`);
       } while (token);
     },
     close() { agent.destroy(); },
