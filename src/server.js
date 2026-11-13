@@ -38,15 +38,19 @@
 // scope 'recipient', 1 day, it can only read links addressed to it and sign out. No uploads, no files, no quota.
 // SHARING=invited (default): only invited wallets (ALLOWED_KEYS) can POST /v1/links or PUT /v1/links/:id/recipient,
 // even with SIGNUP=open; anyone else gets 403 { error: 'sharing_invite_only', message }. Existing links still open.
+//
+// Blobs: BLOB_STORE=fs (default, DATA_DIR/blobs) or s3 (an S3-compatible bucket, see src/blobstore.js). Uploads are
+// always staged in DATA_DIR/tmp and hashed here; only a finished, verified blob goes to the store.
 import { createServer } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createReadStream, createWriteStream, mkdirSync } from 'node:fs';
-import { open, rename, rm, stat, truncate } from 'node:fs/promises';
+import { open, rm, truncate } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { createChallenge, signSession, verifySession, verifySignIn } from '@bwalletx/connect/server';
 import { openDb } from './db.js';
+import { blobStoreFromEnv, BlobMissing } from './blobstore.js';
 
 const env = process.env;
 const PROD = env.NODE_ENV === 'production';
@@ -91,9 +95,9 @@ if (SECRET.length < 32) {
   console.warn('[bdrivex] no SESSION_SECRET: using a random one, so sign-ins end when this process restarts.');
 }
 
-for (const d of ['blobs', 'tmp']) mkdirSync(join(DATA, d), { recursive: true });
+mkdirSync(join(DATA, 'tmp'), { recursive: true });
 const S = openDb(join(DATA, 'bdrivex.db'));
-const blobPath = (h) => join(DATA, 'blobs', h.slice(0, 2), h.slice(2, 4), h);
+const blobs = blobStoreFromEnv(env, DATA);
 const tmpPath = (id) => join(DATA, 'tmp', id);
 const now = () => Date.now();
 const HASH = /^[0-9a-f]{64}$/;
@@ -219,22 +223,38 @@ const sha256File = async (path) => {
   return h.digest('hex');
 };
 
-/** Move a finished tmp file into the blob store under its hash (identical ciphertext is stored once). */
+// One thing at a time per hash: storing a blob and recording its file row, or removing a row and then the blob if it
+// was the last. Without this, a delete could see no holders and remove a blob that a finishing upload has just
+// found already stored (a wider window with a network store). One process, so an in-memory queue is enough.
+const hashQueues = new Map();
+async function oneAtATime(hash, fn) {
+  const before = hashQueues.get(hash) ?? Promise.resolve();
+  let done;
+  const mine = before.then(() => new Promise((r) => { done = r; }));
+  hashQueues.set(hash, mine);
+  await before;
+  try { return await fn(); } finally { done(); if (hashQueues.get(hash) === mine) hashQueues.delete(hash); }
+}
+
+const STORE_DOWN = 'Storage is not answering right now. Your upload is safe here: try finishing it again in a minute.';
+/** Move a finished, hashed tmp file into the blob store under its hash (identical ciphertext is stored once). */
 async function store(tmp, hash) {
-  const dest = blobPath(hash);
-  mkdirSync(join(dest, '..'), { recursive: true });
-  try { await stat(dest); await rm(tmp, { force: true }); } catch { await rename(tmp, dest); }
+  try { await blobs.adopt(hash, tmp); }
+  catch (e) { console.error('[bdrivex] blob store put failed', hash.slice(0, 12), e.message); fail(503, STORE_DOWN, { 'retry-after': '60' }); }
 }
 
 async function unlinkIfOrphan(hash) {
-  if (S.files.refs.get(hash).n === 0) await rm(blobPath(hash), { force: true });
+  if (S.files.refs.get(hash).n !== 0) return;
+  // The file row is gone already; a blob left behind is ciphertext nobody can list, so log it for a sweep, don't fail.
+  try { await blobs.del(hash); } catch (e) { console.error(`[bdrivex] could not delete orphan blob ${hash}: ${e.message}`); }
 }
 
 /** Stream a blob with Range support. Ciphertext only, never rendered by a browser. */
 async function serveBlob(req, res, hash, extra = {}) {
-  const path = blobPath(hash);
   let size;
-  try { size = (await stat(path)).size; } catch { fail(404, 'That file is gone.'); }
+  try { size = await blobs.head(hash); }
+  catch (e) { console.error('[bdrivex] blob store head failed', hash.slice(0, 12), e.message); fail(503, 'Storage is not answering right now. Try again in a minute.', { 'retry-after': '30' }); }
+  if (size == null) fail(404, 'That file is gone.');
   const headers = {
     'content-type': 'application/octet-stream',
     'content-disposition': `attachment; filename="${hash.slice(0, 16)}.bdx"`,
@@ -254,9 +274,11 @@ async function serveBlob(req, res, hash, extra = {}) {
     headers['content-range'] = `bytes ${start}-${end}/${size}`;
   }
   headers['content-length'] = String(size ? end - start + 1 : 0);
+  if (req.method === 'HEAD' || size === 0) { res.writeHead(status, headers); return res.end(); }
+  let body;
+  try { body = await blobs.get(hash, { start, end }); } catch (e) { if (e instanceof BlobMissing) fail(404, 'That file is gone.'); throw e; }
   res.writeHead(status, headers);
-  if (req.method === 'HEAD' || size === 0) return res.end();
-  await pipeline(createReadStream(path, { start, end }), res);
+  await pipeline(body, res);
 }
 
 /** Write the request body to `path` at `offset`, at most `max` bytes. On any failure the file is cut back. */
@@ -380,8 +402,11 @@ route('POST', /^\/v1\/uploads\/([\w-]+)\/complete$/, async (req, owner, [id]) =>
       await rm(tmpPath(id), { force: true });
       fail(422, 'The file arrived changed (its hash does not match). Upload it again.');
     }
-    await store(tmpPath(id), got);
-    S.files.add.run(owner, got, u.size, meta ?? null, now());
+    // If the store is down, store() answers 503 and leaves the upload and its staged file as they were, to finish later.
+    await oneAtATime(got, async () => {
+      await store(tmpPath(id), got);
+      S.files.add.run(owner, got, u.size, meta ?? null, now());
+    });
     S.uploads.del.run(id);
     return [200, { hash: got, size: u.size }];
   } finally { busy.delete(id); }
@@ -412,8 +437,12 @@ route('PUT', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
     await rm(tmp, { force: true });
     fail(422, 'The body does not match its hash.');
   }
-  await store(tmp, hash);
-  S.files.add.run(owner, hash, len, req.headers['x-bdx-meta'] || null, now());
+  try {
+    await oneAtATime(hash, async () => {
+      await store(tmp, hash);
+      S.files.add.run(owner, hash, len, req.headers['x-bdx-meta'] || null, now());
+    });
+  } finally { await rm(tmp, { force: true }); } // nothing to resume for a single PUT
   return [201, { hash, size: len }];
 }, { auth: true });
 
@@ -450,8 +479,10 @@ route('PUT', /^\/v1\/files\/([0-9a-f]{64})\/key$/, async (req, owner, [hash]) =>
 
 route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
   if (!S.files.get.get(owner, hash)) fail(404, 'No such file.');
-  S.files.del.run(owner, hash); // its links go with it (ON DELETE CASCADE)
-  await unlinkIfOrphan(hash);
+  await oneAtATime(hash, async () => {
+    S.files.del.run(owner, hash); // its links go with it (ON DELETE CASCADE)
+    await unlinkIfOrphan(hash);
+  });
   return [204, null];
 }, { auth: true });
 
@@ -598,7 +629,7 @@ const server = createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 0; // big chunks on slow links; headersTimeout still applies
-server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
+server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · blobs ${blobs.describe()} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
 
 // Abandoned uploads (no chunk for 2 days) are cleared out hourly.
 setInterval(async () => {
