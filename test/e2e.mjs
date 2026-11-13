@@ -17,6 +17,7 @@ const { newSeal, sealSegment, sealMeta, importKey, b64u } = await import(join(SI
 const { parseRecipient } = await import(join(SITE, 'js/paymail.js'));
 const { DatabaseSync } = await import('node:sqlite');
 const { startFakeS3 } = await import('./fake-s3.mjs');
+const { keyHash } = await import('../src/admin.js');
 
 // Where blobs go: the fs store (default) or, with BLOB_STORE=s3, a fake S3 bucket here, one prefix per server's data dir.
 const S3 = process.env.BLOB_STORE === 's3';
@@ -28,6 +29,12 @@ const storeEnv = (dir) => S3
 const blobFile = (dir, h) => S3 ? s3fake.objectPath('bdrivex', `${basename(dir)}/${h}`) : join(dir, 'blobs', h.slice(0, 2), h.slice(2, 4), h);
 const placeBlob = (dir, h, buf) => { mkdirSync(dirname(blobFile(dir, h)), { recursive: true }); writeFileSync(blobFile(dir, h), buf); };
 console.log(`blob store: ${S3 ? `s3 (fake, ${s3fake.endpoint})` : 'fs'}`);
+/** Run one of scripts/ against a server's data dir and store; resolves { code, out }. */
+const runScript = (dir, script, args) => new Promise((resolve) => {
+  const p = spawn(process.execPath, [join(dirname(fileURLToPath(import.meta.url)), '../scripts', script), ...args], { env: { PATH: process.env.PATH, DATA_DIR: dir, ...storeEnv(dir) }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = ''; p.stdout.on('data', (x) => { out += x; }); p.stderr.on('data', (x) => { out += x; });
+  p.on('exit', (code) => resolve({ code, out }));
+});
 
 const PORT = 8799, BASE = `http://127.0.0.1:${PORT}`, ORIGIN = 'http://127.0.0.1:5173';
 const wallet = new ProtoWallet(PrivateKey.fromRandom());
@@ -233,6 +240,10 @@ await rejects(api(BASE, T2).call('PUT', `/v1/files/${up.hash}/key`, { json: { ke
 await api(BASE, T2).call('PUT', `/v1/files/${up.hash}/key`, { json: { keyWrap: null } });
 ok((await wrapOf()) === null, 'null clears it');
 
+// it was reported above, so it is on legal hold until an admin releases it
+const held1 = await fetch(`${BASE}/v1/files/${up.hash}`, { method: 'DELETE', headers: { authorization: `Bearer ${T2}` } });
+ok(held1.status === 423 && (await held1.json()).code === 'legal_hold' && existsSync(blob), 'the reported file is on legal hold: DELETE answers 423 and the blob stays');
+ok((await runScript(data, 'legal-hold.mjs', ['release', identityKey, up.hash, '--note', 'test', '--yes'])).code === 0, 'an admin releases the hold (scripts/legal-hold.mjs)');
 await api(BASE, T2).del(`/v1/files/${up.hash}`);
 ok(!existsSync(blob), 'deleting a file removes its blob');
 await rejects(openLink({ base: BASE, id: short.id, key: up.key }), /^404/, 'and its links');
@@ -333,7 +344,9 @@ const startServer = async (port, dir, extra = {}) => {
   };
   const ownerRes = await sign(wallet, identityKey);
   ok(ownerRes.status === 200, 'production defaults to invite-only: an invited wallet signs in');
-  ok((await sign(stranger, sk)).status === 403, 'and a wallet not on the list is refused');
+  const refused = await sign(stranger, sk);
+  const rj = await refused.json();
+  ok(refused.status === 403 && rj.code === 'not_invited' && /invite-only/.test(rj.error) && rj.message === rj.error, 'and a wallet not on the list is refused: 403 { error, code: not_invited, message }');
 
   // ---- v1.2: send to one person
   console.log('send to one person (v1.2)');
@@ -369,7 +382,8 @@ const startServer = async (port, dir, extra = {}) => {
   ok(!('meta' in anon) && !('recipientWrap' in anon) && !('hash' in anon) && !anonJson.includes(rk) && !anonJson.includes('$jon'), 'no meta, no wrap, no hash, nothing about the recipient');
   const blobAs = (t, headers = {}) => fetch(`${B2}/v1/s/${bl.id}/blob`, { headers: { ...(t ? { authorization: `Bearer ${t}` } : {}), ...headers } });
   let r = await blobAs(null);
-  ok(r.status === 403 && /someone else/.test((await r.json()).error), 'the blob is refused to an anonymous user (403, sent to someone else)');
+  const rjson = await r.json();
+  ok(r.status === 403 && /someone else/.test(rjson.error) && rjson.code === 'not_recipient', 'the blob is refused to an anonymous user (403, sent to someone else, code not_recipient)');
   ok((await fetch(`${B2}/v1/s/${bl.id}/blob`, { method: 'HEAD' })).status === 403, 'HEAD too');
   await rejects(openLink({ base: B2, id: bl.id, key: up2.key }), /^403/, 'even with the file key, the anyone-link path refuses a bound link');
   const asOwner = await linkInfo({ base: B2, id: bl.id, token: OT });
@@ -491,9 +505,9 @@ const startServer = async (port, dir, extra = {}) => {
   const nb = Buffer.from(await (await N.call('GET', `/v1/blobs/${nf.hash}`)).arrayBuffer());
   ok(sha(nb) === nf.hash, 'and it reads its own blob back');
 
-  const SHUT = { error: 'sharing_invite_only', message: 'Sharing links are invite-only for now. Your storage works as normal.' };
+  const SHUT = { error: 'sharing_invite_only', code: 'sharing_invite_only', message: 'Sharing links are invite-only for now. Your storage works as normal.' };
   const raw = await fetch(B4 + '/v1/links', { method: 'POST', headers: { authorization: `Bearer ${ns.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ hash: nf.hash }) });
-  ok(raw.status === 403 && JSON.stringify(await raw.json()) === JSON.stringify(SHUT), 'POST /v1/links: 403 { error: sharing_invite_only, message }');
+  ok(raw.status === 403 && JSON.stringify(await raw.json()) === JSON.stringify(SHUT), 'POST /v1/links: 403 { error: sharing_invite_only, code: sharing_invite_only, message } (error stays the code for the site)');
   await rejects(N.post('/v1/links', { hash: nf.hash, recipient: identityKey }), /^403 Sharing links are invite-only for now\. Your storage works as normal\.$/, 'a link for one person too (and the site client shows the message)');
   await rejects(makeLink({ base: B4, token: ns.token, site: 'https://bdrivex.com', hash: nf.hash, key: nf.key, recipient: identityKey, wallet: nw }), /^403 Sharing/, 'makeLink stops before asking the wallet to wrap anything');
   const e403 = await N.post('/v1/links', { hash: nf.hash }).catch((e) => e);
@@ -530,6 +544,149 @@ const startServer = async (port, dir, extra = {}) => {
   s4b.kill(); rmSync(d4, { recursive: true, force: true });
 }
 
+// ---- legal hold, report retention, scrubbing revoked/expired links, closing an account, CORS for bstorex, error codes
+{
+  console.log('legal hold, retention, scrubbing, closing an account');
+  const P5 = 8795, B5 = `http://127.0.0.1:${P5}`, d5 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const s5 = await startServer(P5, d5, { SIGNUP: 'open', SHARING: 'open', HOUSEKEEPING_MS: '300', BLOB_DELETE_RETRY_MS: '300' });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms = 4000) => { for (let i = 0; i < ms / 100 && !fn(); i++) await sleep(100); return fn(); };
+  const sign5 = async (w, k) => {
+    const c = await (await fetch(B5 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k }) })).json();
+    const { signature } = await w.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
+    return (await fetch(B5 + '/v1/auth/verify', { method: 'POST', headers: { 'content-type': 'application/json', origin: ORIGIN }, body: JSON.stringify({ identityKey: k, nonce: c.nonce, signature: Array.from(signature) }) })).json();
+  };
+  const db5 = () => { const d = new DatabaseSync(join(d5, 'bdrivex.db')); d.exec('PRAGMA busy_timeout = 5000'); return d; };
+  const q5 = (sql, ...a) => { const d = db5(); try { return d.prepare(sql).all(...a); } finally { d.close(); } };
+  const run5 = (script, args) => runScript(d5, script, args);
+  const aw = new ProtoWallet(PrivateKey.fromRandom()), ak = (await aw.getPublicKey({ identityKey: true })).publicKey; // the account to close
+  const bw = new ProtoWallet(PrivateKey.fromRandom()), bk = (await bw.getPublicKey({ identityKey: true })).publicKey;
+  let AT = (await sign5(aw, ak)).token;
+  await fetch(B5 + '/v1/auth/signout-all', { method: 'POST', headers: { authorization: `Bearer ${AT}` } }); // gives it a sign-out counter row
+  AT = (await sign5(aw, ak)).token;
+  const BT = (await sign5(bw, bk)).token;
+  const A = api(B5, AT), Bw = api(B5, BT);
+  const put5 = async (who, b) => { const h = sha(b); await who.call('PUT', `/v1/blobs/${h}`, { body: b }); return h; };
+  const [b1, b2, b3, b4] = [randomBytes(3000), randomBytes(3100), randomBytes(3200), randomBytes(3300)];
+  const [h1, h2, h3, h4] = [await put5(A, b1), await put5(A, b2), await put5(A, b3), await put5(A, b4)];
+  await put5(Bw, b3); // bw holds the same bytes as h3
+  await A.call('PUT', `/v1/files/${h2}/key`, { json: { keyWrap: 'AAAA' } });
+  const pending5 = await A.post('/v1/uploads', { size: 64 });
+
+  // a report holds the file
+  const l1 = await A.post('/v1/links', { hash: h1 });
+  ok((await fetch(`${B5}/v1/s/${l1.id}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'illegal' }) })).status === 204, 'a report is taken');
+  const files5 = (await A.get('/v1/files')).files;
+  ok(files5.find((f) => f.hash === h1).held === true && files5.find((f) => f.hash === h2).held === false, 'GET /v1/files: the reported file shows held: true, the others false');
+  const d423 = await fetch(`${B5}/v1/files/${h1}`, { method: 'DELETE', headers: { authorization: `Bearer ${AT}` } });
+  const j423 = await d423.json();
+  ok(d423.status === 423 && j423.code === 'legal_hold' && /support@bwalletx\.com/.test(j423.error), `DELETE a held file: 423 { code: legal_hold }: ${j423.error}`);
+  ok((await A.get('/v1/files')).files.some((f) => f.hash === h1) && existsSync(blobFile(d5, h1)), 'and the file and its blob stay');
+  const rrow = q5('SELECT * FROM reports WHERE link_id = ?', l1.id)[0];
+  ok(rrow.owner === ak && rrow.hash === h1 && /127\.0\.0\.1|::1/.test(rrow.ip), 'the report record keeps owner, file and (for now) the reporter IP');
+  ok(q5('SELECT * FROM holds WHERE owner = ? AND hash = ? AND released_at IS NULL', ak, h1).length === 1, 'and a hold row');
+  const again = await fetch(`${B5}/v1/s/${l1.id}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'again' }) });
+  ok(again.status === 204 && q5('SELECT * FROM holds WHERE owner = ? AND hash = ?', ak, h1).length === 1, 'a second report of the same link adds no second hold');
+
+  // release by the admin script, then the owner can delete; the report outlives the file
+  const l4 = await A.post('/v1/links', { hash: h4 });
+  await fetch(`${B5}/v1/s/${l4.id}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ reason: 'spam' }) });
+  const ls = await run5('legal-hold.mjs', ['list']);
+  ok(ls.code === 0 && ls.out.includes(`file ${h1}`) && ls.out.includes(`file ${h4}`) && /active holds: 2/.test(ls.out), 'legal-hold.mjs list shows both holds and their reports');
+  const rl0 = await run5('legal-hold.mjs', ['release', ak, h4, '--note', 'reviewed, fine']);
+  ok(rl0.code === 0 && /would release/.test(rl0.out) && q5('SELECT 1 FROM holds WHERE hash = ? AND released_at IS NULL', h4).length === 1, 'release without --yes changes nothing');
+  ok((await run5('legal-hold.mjs', ['release', ak, h4])).code === 2, 'release needs --note');
+  const rl1 = await run5('legal-hold.mjs', ['release', ak, h4, '--note', 'reviewed, fine', '--yes']);
+  ok(rl1.code === 0 && /released 1/.test(rl1.out), `release --yes: ${rl1.out.trim()}`);
+  ok((await fetch(`${B5}/v1/files/${h4}`, { method: 'DELETE', headers: { authorization: `Bearer ${AT}` } })).status === 204, 'once released, the owner can delete it');
+  ok(q5('SELECT * FROM reports WHERE link_id = ?', l4.id)[0]?.hash === h4 && q5('SELECT 1 FROM links WHERE id = ?', l4.id).length === 0, 'the report record survives the file (and its links) being deleted');
+
+  // scrubbing who a link was for, 7 days after it was revoked or expired
+  const g = await put5(Bw, randomBytes(2000));
+  const mk = async (who, hash, rk) => { const l = await who.post('/v1/links', { hash, recipient: rk, recipientLabel: '$someone' }); await who.call('PUT', `/v1/links/${l.id}/recipient`, { json: { recipient: rk, recipientWrap: 'AAAA' } }); return l.id; };
+  const [oldRevoked, oldExpired, newRevoked, live, heldOld] = [await mk(Bw, g, ak), await mk(Bw, g, ak), await mk(Bw, g, ak), await mk(Bw, g, ak), await mk(A, h1, bk)];
+  await Bw.del(`/v1/links/${newRevoked}`);
+  {
+    const d = db5(), eight = Date.now() - 8 * 86400e3;
+    d.prepare('UPDATE links SET revoked_at = ? WHERE id IN (?, ?)').run(eight, oldRevoked, heldOld);
+    d.prepare('UPDATE links SET expires_at = ? WHERE id = ?').run(eight, oldExpired);
+    // retention rows: a report older than 3 years, one 31 days old with a raw IP, an old released hold, an old active hold
+    const t = Date.now();
+    d.prepare('INSERT INTO reports (link_id, at, reason, ip, owner, hash) VALUES (?, ?, ?, ?, ?, ?)').run('A'.repeat(22), t - 1097 * 86400e3, 'ancient', '198.51.100.7', bk, g);
+    d.prepare('INSERT INTO reports (link_id, at, reason, ip, owner, hash) VALUES (?, ?, ?, ?, ?, ?)').run('B'.repeat(22), t - 31 * 86400e3, 'last month', '203.0.113.9', bk, g);
+    d.prepare('INSERT INTO holds (owner, hash, link_id, placed_at, reason, released_at, released_note) VALUES (?, ?, ?, ?, ?, ?, ?)').run(bk, 'c'.repeat(64), null, t - 1200 * 86400e3, 'x', t - 1097 * 86400e3, 'old');
+    d.prepare('INSERT INTO holds (owner, hash, link_id, placed_at, reason) VALUES (?, ?, ?, ?, ?)').run(bk, 'd'.repeat(64), null, t - 1200 * 86400e3, 'still active');
+    d.close();
+  }
+  const linkRow = (id) => q5('SELECT * FROM links WHERE id = ?', id)[0];
+  await until(() => linkRow(oldRevoked).recipient === null && linkRow(oldExpired).recipient === null);
+  const scrubbed = (id) => { const l = linkRow(id); return l.recipient === null && l.recipient_wrap === null && l.recipient_label === null && Number.isInteger(l.recipient_scrubbed_at); };
+  ok(scrubbed(oldRevoked) && scrubbed(oldExpired), 'links revoked or expired over 7 days ago lose recipient key, wrap and label (housekeeping)');
+  ok(linkRow(newRevoked).recipient === ak && linkRow(live).recipient === ak && linkRow(live).recipient_label === '$someone', 'a link revoked just now, and a live link, keep theirs');
+  ok(linkRow(heldOld).recipient === bk, 'a link on a file under legal hold keeps its recipient while the hold lasts');
+  const bl5 = (await Bw.get('/v1/files')).files.find((f) => f.hash === g).links.find((l) => l.id === oldRevoked);
+  ok(bl5.bound === true && bl5.recipient === null && bl5.recipientLabel === null && Number.isInteger(bl5.scrubbedAt), 'the sender still sees it was sent to one person, not to whom');
+  await until(() => q5("SELECT ip FROM reports WHERE link_id = ?", 'B'.repeat(22))[0]?.ip?.startsWith('h:'));
+  ok(q5('SELECT 1 FROM reports WHERE link_id = ?', 'A'.repeat(22)).length === 0, 'report records older than 3 years are deleted');
+  const hashed = q5('SELECT ip FROM reports WHERE link_id = ?', 'B'.repeat(22))[0].ip;
+  ok(/^h:[0-9a-f]{32}$/.test(hashed) && !hashed.includes('203.0.113.9'), `a reporter IP older than 30 days is replaced by a keyed hash (${hashed.slice(0, 10)}…)`);
+  ok(!q5('SELECT ip FROM reports WHERE link_id = ?', l1.id)[0].ip.startsWith('h:'), 'a recent reporter IP is kept as it is');
+  ok(q5('SELECT 1 FROM holds WHERE hash = ?', 'c'.repeat(64)).length === 0 && q5('SELECT 1 FROM holds WHERE hash = ?', 'd'.repeat(64)).length === 1, 'released holds older than 3 years go; an active hold is never aged out');
+
+  // closing the account
+  const before = q5('SELECT COUNT(*) AS n FROM files WHERE owner = ?', ak)[0].n;
+  const dry = await run5('close-account.mjs', [ak]);
+  ok(dry.code === 0 && /dry run: nothing changed/.test(dry.out) && /would REFUSE/.test(dry.out) && q5('SELECT COUNT(*) AS n FROM files WHERE owner = ?', ak)[0].n === before && (await me5(AT)) === 200, 'close-account without --yes is a dry run: nothing changes, and it warns about the hold');
+  async function me5(t) { return (await fetch(B5 + '/v1/me', { headers: { authorization: `Bearer ${t}` } })).status; }
+  ok((await run5('close-account.mjs', ['nonsense'])).code === 2, 'a bad identity key is refused');
+  const ref = await run5('close-account.mjs', [ak, '--yes']);
+  ok(ref.code === 1 && /REFUSED/.test(ref.out) && q5('SELECT COUNT(*) AS n FROM files WHERE owner = ?', ak)[0].n === before && (await me5(AT)) === 200, 'with a held file, --yes refuses and deletes nothing');
+  const kh = await run5('close-account.mjs', [ak, '--yes', '--keep-held']);
+  ok(kh.code === 0 && /closed /.test(kh.out), `--yes --keep-held: ${kh.out.trim().split('\n').at(-1)}`);
+  const rowsA = q5('SELECT hash FROM files WHERE owner = ?', ak).map((r) => r.hash);
+  ok(rowsA.length === 1 && rowsA[0] === h1 && existsSync(blobFile(d5, h1)), 'the held file stays, with its blob');
+  ok(!existsSync(blobFile(d5, h2)) && existsSync(blobFile(d5, h3)), 'its own blob is deleted; a blob another wallet also holds is kept');
+  ok(q5('SELECT reason FROM erased_blobs WHERE hash = ?', h2)[0]?.reason === 'account closed' && q5('SELECT 1 FROM erased_blobs WHERE hash = ?', h3).length === 0, 'the deletion log names the deleted blob (so the B2 prune follows), not the shared one');
+  ok(q5('SELECT COUNT(*) AS n FROM links WHERE owner = ?', ak)[0].n === 0 && q5('SELECT COUNT(*) AS n FROM uploads WHERE owner = ?', ak)[0].n === 0 && !existsSync(join(d5, 'tmp', pending5.id)), 'its links and unfinished uploads (rows and staged bytes) are gone');
+  ok(q5('SELECT COUNT(*) AS n FROM generations WHERE owner = ?', ak)[0].n === 0 && q5('SELECT COUNT(*) AS n FROM nonces WHERE instr(data, ?) > 0', ak)[0].n === 0, 'the sign-out counter and sign-in nonces for the key are gone');
+  const closedRows = q5('SELECT * FROM closed_accounts');
+  ok(closedRows.length === 1 && closedRows[0].key_hash === keyHash(ak) && !JSON.stringify(closedRows).includes(ak) && closedRows[0].purge_after - closedRows[0].closed_at === 8 * 86400e3, 'closed_accounts keeps a hash of the key (never the key), for 8 days');
+  const m401 = await fetch(B5 + '/v1/me', { headers: { authorization: `Bearer ${AT}` } });
+  ok(m401.status === 401 && (await m401.json()).code === 'account_closed', 'a token from before the close is refused: 401 account_closed');
+  ok((await Bw.get('/v1/files')).files.some((f) => f.hash === h3) && (await me5(BT)) === 200, 'the other wallet keeps its file and its session');
+  ok(q5('SELECT COUNT(*) AS n FROM reports WHERE owner = ?', ak)[0].n === 2, 'report records about the account are kept');
+  await run5('legal-hold.mjs', ['release', ak, h1, '--note', 'reviewed', '--yes']);
+  const fin = await run5('close-account.mjs', [ak, '--yes']);
+  ok(fin.code === 0 && q5('SELECT COUNT(*) AS n FROM files WHERE owner = ?', ak)[0].n === 0 && !existsSync(blobFile(d5, h1)), 'after the hold is released, closing again removes the last file and its blob');
+  await sleep(1100); // tokens carry iat in seconds
+  const reborn = await sign5(aw, ak);
+  ok(reborn.token && (await me5(reborn.token)) === 200 && (await api(B5, reborn.token).get('/v1/files')).files.length === 0, 'the wallet can sign up again afterwards, with nothing left');
+
+  // CORS: bstorex.com is on the production default list; Retry-After is exposed; 429 says rate_limited
+  let r429;
+  for (let i = 0; i < 12 && !r429; i++) {
+    const r = await fetch(`${B5}/v1/s/${'Z'.repeat(22)}/report`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    if (r.status === 429) r429 = r; else await r.arrayBuffer();
+  }
+  const j429 = r429 && await r429.json();
+  ok(r429 && j429.code === 'rate_limited' && /Too many/.test(j429.error) && Number(r429.headers.get('retry-after')) > 0, `429: { code: rate_limited } with Retry-After ${r429?.headers.get('retry-after')}`);
+  ok(/Retry-After/.test(r429?.headers.get('access-control-expose-headers') || ''), 'Retry-After is in Access-Control-Expose-Headers');
+  await new Promise((r) => { s5.on('exit', r); s5.kill(); });
+  rmSync(d5, { recursive: true, force: true });
+
+  const P6 = 8794, B6 = `http://127.0.0.1:${P6}`, d6 = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
+  const s6 = await startServer(P6, d6, { ALLOWED_ORIGINS: '' }); // production, no ALLOWED_ORIGINS: the default list
+  const acao = async (origin) => (await fetch(B6 + '/v1/me', { headers: { origin } })).headers.get('access-control-allow-origin');
+  ok(await acao('https://bstorex.com') === 'https://bstorex.com' && await acao('https://www.bstorex.com') === 'https://www.bstorex.com', 'production default origins include bstorex.com and www.bstorex.com');
+  ok(await acao('https://bdrivex.com') === 'https://bdrivex.com' && await acao('https://www.bdrivex.com') === 'https://www.bdrivex.com' && await acao('https://evil.example') === null, 'and still bdrivex.com, www.bdrivex.com, and nothing else');
+  const chB = await fetch(B6 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://bstorex.com' }, body: JSON.stringify({ identityKey }) });
+  const chE = await fetch(B6 + '/v1/auth/challenge', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'https://evil.example' }, body: JSON.stringify({ identityKey }) });
+  ok(chB.status === 200 && chE.status === 403 && (await chE.json()).code === 'origin_not_allowed', 'sign-in challenge from bstorex.com works; another origin gets 403 origin_not_allowed');
+  const s401 = await fetch(B6 + '/v1/files');
+  ok(s401.status === 401 && (await s401.json()).code === 'signin_required', 'no session: 401 signin_required');
+  s6.kill(); rmSync(d6, { recursive: true, force: true });
+}
+
 // ---- migration: a v1.1 database (no recipient columns) opens, gains them, and its links keep working
 {
   console.log('migration from a v1.1 database');
@@ -554,6 +711,10 @@ const startServer = async (port, dir, extra = {}) => {
   const lid = randomBytes(16).toString('base64url');
   old.prepare('INSERT INTO files (owner, hash, size, meta, created_at, key_wrap) VALUES (?, ?, ?, ?, ?, ?)').run(identityKey, hh, sealed.length, await sealMeta(ck3, h3, { name: 'old.bin', type: '', size: plain.length }), Date.now(), 'AAAA');
   old.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(lid, identityKey, hh, Date.now(), Date.now() + 86400e3);
+  // a second link that was reported before reports kept owner and hash, or files were held
+  const lid2 = randomBytes(16).toString('base64url');
+  old.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(lid2, identityKey, hh, Date.now(), Date.now() + 86400e3);
+  old.prepare('INSERT INTO reports (link_id, at, reason, ip) VALUES (?, ?, ?, ?)').run(lid2, Date.now() - 1000, 'old report', '192.0.2.1');
   ok(!old.prepare('PRAGMA table_info(links)').all().some((c) => c.name === 'recipient'), 'the v1.1 database has no recipient columns');
   old.close();
   const s3 = await startServer(P3, d3, { ALLOWED_KEYS: identityKey });
@@ -561,6 +722,9 @@ const startServer = async (port, dir, extra = {}) => {
   const cols = db3.prepare('PRAGMA table_info(links)').all().map((c) => c.name);
   ok(['recipient', 'recipient_wrap', 'recipient_label'].every((c) => cols.includes(c)), `after start the links table has ${cols.slice(-3).join(', ')}`);
   ok(db3.prepare("SELECT 1 AS n FROM sqlite_master WHERE type = 'index' AND name = 'links_recipient'").get()?.n === 1, 'and an index on recipient');
+  const oldRep = db3.prepare('SELECT * FROM reports WHERE link_id = ?').get(lid2);
+  ok(oldRep.owner === identityKey && oldRep.hash === hh, 'a report from before the migration gains owner and file from its link');
+  ok(db3.prepare('SELECT COUNT(*) AS n FROM holds WHERE owner = ? AND hash = ? AND released_at IS NULL').get(identityKey, hh).n === 1, 'and its file is put on legal hold');
   db3.close();
   const li = await openLink({ base: B3, id: lid, key: b64u(k3) });
   const ps4 = [];
@@ -570,6 +734,7 @@ const startServer = async (port, dir, extra = {}) => {
   // a second start on the migrated database is a no-op
   const s3b = await startServer(P3, d3, { ALLOWED_KEYS: identityKey });
   ok((await fetch(B3 + '/health')).status === 200, 'starting again on the migrated database works (migration is idempotent)');
+  { const d = new DatabaseSync(join(d3, 'bdrivex.db')); ok(d.prepare('SELECT COUNT(*) AS n FROM holds').get().n === 1, 'and places no second hold'); d.close(); }
   s3b.kill(); rmSync(d3, { recursive: true, force: true });
 }
 

@@ -22,7 +22,15 @@
 //   DELETE /v1/links/:id                                                -> revoke
 //   GET    /v1/s/:id               public                               -> { size, meta, createdAt, expiresAt }
 //   GET    /v1/s/:id/blob          public, Range ok                     -> ciphertext
-//   POST   /v1/s/:id/report        public { reason }                   -> the link is switched off at once
+//   POST   /v1/s/:id/report        public { reason }                   -> the link is switched off at once, the file is held
+//
+// Refusals a client needs to tell apart carry a machine-readable code: { error: <sentence>, code, message: <sentence> }
+// (sharing_invite_only keeps error = the code, as the site already checks it). Codes: see README "Errors".
+//
+// Legal hold: a report holds the reported file. Its owner can't delete it (DELETE answers 423 legal_hold) until an
+// admin releases the hold (scripts/legal-hold.mjs). Reports are kept 3 years; reporter IPs are hashed after 30 days.
+// Revoked or expired links lose their recipient key, wrap and label after 7 days (not while the file is held).
+// Accounts are closed by an admin (scripts/close-account.mjs); tokens issued before that stop working.
 //
 // v1.2 links sent to one person. A link with a `recipient` (identity key) is bound to that wallet:
 //   - GET /v1/s/:id shows anyone else only { bound, from, size, createdAt, expiresAt }: no meta, no wrap, nothing
@@ -51,13 +59,16 @@ import { Transform } from 'node:stream';
 import { createChallenge, signSession, verifySession, verifySignIn } from '@bwalletx/connect/server';
 import { openDb } from './db.js';
 import { blobStoreFromEnv, BlobMissing } from './blobstore.js';
+import { keyHash, hashIp } from './admin.js';
 
 const env = process.env;
 const PROD = env.NODE_ENV === 'production';
 const PORT = Number(env.PORT || 8787);
 const HOST = env.HOST || '127.0.0.1';
 const DATA = env.DATA_DIR || join(process.cwd(), 'data');
-const ORIGINS = (env.ALLOWED_ORIGINS || (PROD ? 'https://bdrivex.com,https://www.bdrivex.com' : 'http://127.0.0.1:5173,http://localhost:5173'))
+// Sites that may sign in and call the API from a browser: bdrivex.com and bstorex.com (the same storage, two fronts).
+const PROD_ORIGINS = 'https://bdrivex.com,https://www.bdrivex.com,https://bstorex.com,https://www.bstorex.com';
+const ORIGINS = (env.ALLOWED_ORIGINS || (PROD ? PROD_ORIGINS : 'http://127.0.0.1:5173,http://localhost:5173'))
   .split(',').map((s) => s.trim()).filter(Boolean);
 const GiB = 1024 ** 3;
 // Open sign-up, free storage (owner, 2 Nov 2026): anyone with a bWalletX gets QUOTA_BYTES until payments exist.
@@ -89,6 +100,14 @@ if (!['open', 'invited'].includes(SHARING)) throw new Error('SHARING must be ope
 const TRUST_PROXY = env.TRUST_PROXY === '1';
 // How often blob deletes that failed (store unreachable) are tried again. Default 10 minutes.
 const BLOB_DELETE_RETRY_MS = Number(env.BLOB_DELETE_RETRY_MS || 600_000);
+// Retention (owner, Nov 2026): report records 3 years (1096 days covers a leap year), reporter IPs hashed after 30
+// days, revoked/expired links scrubbed of who they were for after 7 days. Checked every HOUSEKEEPING_MS (1 hour).
+const DAY = 86400_000;
+const REPORT_KEEP_MS = Number(env.REPORT_KEEP_DAYS || 1096) * DAY;
+const REPORT_IP_HASH_MS = Number(env.REPORT_IP_HASH_DAYS || 30) * DAY;
+const LINK_SCRUB_MS = Number(env.LINK_SCRUB_DAYS || 7) * DAY;
+const HOUSEKEEPING_MS = Number(env.HOUSEKEEPING_MS || 3600_000);
+const SUPPORT = 'support@bwalletx.com';
 
 let SECRET = env.SESSION_SECRET || '';
 if (SECRET.length < 32) {
@@ -128,7 +147,9 @@ const nonceStore = {
 
 // ---------- small HTTP helpers
 
-// `code`, when given, goes out as { error: code, message } so a client can tell this refusal from the others.
+// `code`, when given, goes out as { error: message, code, message } so a client can tell this refusal from the others.
+// sharing_invite_only came first as { error: code, message } and the site checks body.error, so it keeps that.
+const CODE_IN_ERROR = new Set(['sharing_invite_only']);
 class HttpError extends Error {
   constructor(status, message, headers, code) { super(message); this.status = status; this.headers = headers; this.code = code; }
 }
@@ -164,7 +185,7 @@ function bump(k, perMs, by = 1) {
   return w.n;
 }
 const slowDown = (perMs, msg = 'Too many requests. Wait a minute and try again.') =>
-  fail(429, msg, { 'retry-after': String(Math.ceil(Math.min(perMs, 3600_000) / 1000)) });
+  fail(429, msg, { 'retry-after': String(Math.ceil(Math.min(perMs, 3600_000) / 1000)) }, 'rate_limited');
 function limit(req, name, max, perMs, owner, ownerMax = max) {
   if (bump(`${name}|ip|${ip(req)}`, perMs) > max) slowDown(perMs);
   if (owner && bump(`${name}|key|${owner}`, perMs) > ownerMax) slowDown(perMs);
@@ -177,7 +198,7 @@ function cors(req, res, isPublic) {
   const o = req.headers.origin;
   if (isPublic) res.setHeader('access-control-allow-origin', '*');
   else if (o && ORIGINS.includes(o)) { res.setHeader('access-control-allow-origin', o); res.setHeader('vary', 'Origin'); }
-  res.setHeader('access-control-expose-headers', 'Upload-Offset, Upload-Length, Content-Range, Content-Length, Accept-Ranges');
+  res.setHeader('access-control-expose-headers', 'Upload-Offset, Upload-Length, Content-Range, Content-Length, Accept-Ranges, Retry-After');
 }
 
 const invited = (key) => ALLOWED_KEYS.has(key);
@@ -189,9 +210,14 @@ const genOf = (owner) => S.sessions.gen.get(owner)?.gen ?? 0;
 async function sessionFrom(req) {
   const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
   const s = m && (await verifySession(m[1], { secret: SECRET }));
-  if (!s || typeof s.sid !== 'string' || S.sessions.isRevoked.get(s.sid) || s.gen !== genOf(s.sub)) fail(401, 'Sign in with bWalletX first.');
+  if (!s || typeof s.sid !== 'string' || typeof s.sub !== 'string') fail(401, 'Sign in with bWalletX first.', undefined, 'signin_required');
+  // Closed by an admin (scripts/close-account.mjs): every token issued up to then is dead. iat is in seconds. Checked
+  // before the generation, which closing deletes (so an old token would otherwise read as merely signed out).
+  const closed = S.closed.get.get(keyHash(s.sub));
+  if (closed && !(s.iat > Math.floor(closed.closed_at / 1000))) fail(401, 'This account was closed. Sign in again to start afresh.', undefined, 'account_closed');
+  if (S.sessions.isRevoked.get(s.sid) || s.gen !== genOf(s.sub)) fail(401, 'Sign in with bWalletX first.', undefined, 'signin_required');
   // A browser token works only on the site it was signed for. Agents and CLIs send no Origin.
-  if (req.headers.origin && s.aud && req.headers.origin !== s.aud) fail(401, 'This sign-in belongs to another site.');
+  if (req.headers.origin && s.aud && req.headers.origin !== s.aud) fail(401, 'This sign-in belongs to another site.', undefined, 'wrong_site');
   return s;
 }
 /** Public routes: the session if a valid one was sent, else null (a stale token is treated as none). */
@@ -202,8 +228,8 @@ async function maybeSession(req) {
 const isRecipientSession = (s) => s.scope === 'recipient'; // v1.1 tokens have no scope: full sessions
 async function auth(req, r) {
   const s = await sessionFrom(req);
-  if (isRecipientSession(s)) { if (!r.recipientOk) fail(403, 'This sign-in can only open files sent to you.'); }
-  else if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.');
+  if (isRecipientSession(s)) { if (!r.recipientOk) fail(403, 'This sign-in can only open files sent to you.', undefined, 'recipient_only'); }
+  else if (!admitted(s.sub)) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list.', undefined, 'not_invited');
   else if (r.share && !canShare(s.sub)) fail(403, SHARING_SHUT, undefined, 'sharing_invite_only');
   req.session = s;
   return s.sub;
@@ -214,9 +240,9 @@ function usage(owner) {
   return { bytes: u.stored, files: u.files, pending: u.pending, quota: quotaOf(owner), maxFile: MAX_FILE };
 }
 function roomFor(owner, size) {
-  if (size > MAX_FILE) fail(413, `Files up to ${Math.floor(MAX_FILE / GiB)} GB for now.`);
+  if (size > MAX_FILE) fail(413, `Files up to ${Math.floor(MAX_FILE / GiB)} GB for now.`, undefined, 'file_too_large');
   const u = usage(owner);
-  if (u.bytes + u.pending + size > quotaOf(owner)) fail(413, 'That would take you over your storage allowance. Delete something first.');
+  if (u.bytes + u.pending + size > quotaOf(owner)) fail(413, 'That would take you over your storage allowance. Delete something first.', undefined, 'quota_exceeded');
 }
 
 const sha256File = async (path) => {
@@ -243,7 +269,7 @@ const STORE_DOWN = 'Storage is not answering right now. Your upload is safe here
 /** Move a finished, hashed tmp file into the blob store under its hash (identical ciphertext is stored once). */
 async function store(tmp, hash) {
   try { await blobs.adopt(hash, tmp); }
-  catch (e) { console.error('[bdrivex] blob store put failed', hash.slice(0, 12), e.message); fail(503, STORE_DOWN, { 'retry-after': '60' }); }
+  catch (e) { console.error('[bdrivex] blob store put failed', hash.slice(0, 12), e.message); fail(503, STORE_DOWN, { 'retry-after': '60' }, 'storage_unavailable'); }
 }
 
 /**
@@ -275,7 +301,7 @@ async function retryBlobDeletes() {
 async function serveBlob(req, res, hash, extra = {}) {
   let size;
   try { size = await blobs.head(hash); }
-  catch (e) { console.error('[bdrivex] blob store head failed', hash.slice(0, 12), e.message); fail(503, 'Storage is not answering right now. Try again in a minute.', { 'retry-after': '30' }); }
+  catch (e) { console.error('[bdrivex] blob store head failed', hash.slice(0, 12), e.message); fail(503, 'Storage is not answering right now. Try again in a minute.', { 'retry-after': '30' }, 'storage_unavailable'); }
   if (size == null) fail(404, 'That file is gone.');
   const headers = {
     'content-type': 'application/octet-stream',
@@ -334,7 +360,7 @@ const route = (method, pattern, fn, opts = {}) => routes.push({ method, pattern,
 route('POST', /^\/v1\/auth\/challenge$/, async (req) => {
   limit(req, 'auth', 30, 600_000);
   const origin = req.headers.origin;
-  if (!origin || !ORIGINS.includes(origin)) fail(403, 'Sign in from bdrivex.com.');
+  if (!origin || !ORIGINS.includes(origin)) fail(403, 'Sign in from bdrivex.com or bstorex.com.', undefined, 'origin_not_allowed');
   const { identityKey } = await readJson(req);
   try { return [200, await createChallenge({ origin, identityKey, store: nonceStore })]; }
   catch (e) { fail(400, e.message); }
@@ -343,15 +369,15 @@ route('POST', /^\/v1\/auth\/challenge$/, async (req) => {
 route('POST', /^\/v1\/auth\/verify$/, async (req) => {
   limit(req, 'auth', 30, 600_000);
   const origin = req.headers.origin;
-  if (!origin || !ORIGINS.includes(origin)) fail(403, 'Sign in from bdrivex.com.');
+  if (!origin || !ORIGINS.includes(origin)) fail(403, 'Sign in from bdrivex.com or bstorex.com.', undefined, 'origin_not_allowed');
   const b = await readJson(req);
   const key = await verifySignIn({ origin, store: nonceStore, identityKey: b.identityKey, nonce: b.nonce, signature: b.signature });
-  if (!key) fail(401, 'That signature was not accepted. Start again.');
+  if (!key) fail(401, 'That signature was not accepted. Start again.', undefined, 'bad_signature');
   let scope = 'full', maxAge = SESSION_DAYS * 86400;
   if (!admitted(key)) {
     // Not invited, but someone sent this wallet a file: a recipient session that can only open it (v1.2).
     limit(req, 'auth-recipient', 20, 3600_000, key, 10);
-    if (!S.links.liveFor.get(key, now())) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.');
+    if (!S.links.liveFor.get(key, now())) fail(403, 'bDriveX is invite-only for now, and this wallet is not on the list yet.', undefined, 'not_invited');
     scope = 'recipient';
     maxAge = RECIPIENT_SESSION_HOURS * 3600;
   }
@@ -479,12 +505,13 @@ route('GET', /^\/v1\/blobs\/([0-9a-f]{64})$/, async (req, owner, [hash], res) =>
 // wrap is in place. The wrap itself is not repeated here; only the recipient needs it.
 const linkView = (l) => ({
   id: l.id, createdAt: l.created_at, expiresAt: l.expires_at, revokedAt: l.revoked_at, downloads: l.downloads, reported: !!S.reports.get.get(l.id),
-  bound: !!l.recipient, recipient: l.recipient ?? null, recipientLabel: l.recipient_label ?? null, ready: !l.recipient || !!l.recipient_wrap,
+  bound: !!l.recipient || !!l.recipient_scrubbed_at, recipient: l.recipient ?? null, recipientLabel: l.recipient_label ?? null,
+  ready: !l.recipient || !!l.recipient_wrap, scrubbedAt: l.recipient_scrubbed_at ?? null,
 });
 
 route('GET', /^\/v1\/files$/, async (req, owner) => {
   const files = S.files.mine.all(owner).map((f) => ({
-    hash: f.hash, size: f.size, meta: f.meta, keyWrap: f.key_wrap ?? null, createdAt: f.created_at,
+    hash: f.hash, size: f.size, meta: f.meta, keyWrap: f.key_wrap ?? null, createdAt: f.created_at, held: !!S.holds.active.get(owner, f.hash),
     links: S.links.forFile.all(owner, f.hash).map(linkView),
   }));
   return [200, { files, usage: usage(owner) }];
@@ -501,9 +528,12 @@ route('PUT', /^\/v1\/files\/([0-9a-f]{64})\/key$/, async (req, owner, [hash]) =>
   return [204, null];
 }, { auth: true });
 
+const HELD = `This file was reported, so it is kept until we have looked at the report. Write to ${SUPPORT} if you need it gone.`;
 route('DELETE', /^\/v1\/files\/([0-9a-f]{64})$/, async (req, owner, [hash]) => {
   if (!S.files.get.get(owner, hash)) fail(404, 'No such file.');
   await oneAtATime(hash, async () => {
+    // Legal hold (a report, or an admin): the file and its row stay until scripts/legal-hold.mjs releases it.
+    if (S.holds.active.get(owner, hash)) fail(423, HELD, undefined, 'legal_hold');
     S.files.del.run(owner, hash); // its links go with it (ON DELETE CASCADE)
     await unlinkIfOrphan(hash, 'user delete');
   });
@@ -562,9 +592,9 @@ route('DELETE', /^\/v1\/links\/([\w-]+)$/, async (req, owner, [id]) => {
 
 function liveLink(id) {
   const l = ID.test(id) && S.links.get.get(id);
-  if (l && S.reports.get.get(id)) fail(404, 'This link was switched off after a report.');
-  if (!l || l.revoked_at) fail(404, 'This link was switched off or never existed.');
-  if (l.expires_at && l.expires_at < now()) fail(410, 'This link has expired. Ask the sender for a new one.');
+  if (l && S.reports.get.get(id)) fail(404, 'This link was switched off after a report.', undefined, 'link_reported');
+  if (!l || l.revoked_at) fail(404, 'This link was switched off or never existed.', undefined, 'link_off');
+  if (l.expires_at && l.expires_at < now()) fail(410, 'This link has expired. Ask the sender for a new one.', undefined, 'link_expired');
   return l;
 }
 
@@ -585,14 +615,14 @@ route('GET', /^\/v1\/s\/([\w-]+)$/, async (req, _o, [id]) => {
   // Sent to one person: anyone else learns only that, who sent it, and the size and dates. Never the recipient.
   const view = { id, bound: true, to: null, from: l.owner, size: f.size, createdAt: l.created_at, expiresAt: l.expires_at };
   if (!(await asRecipient(req, l))) return [200, { ...view, forYou: false }];
-  if (!l.recipient_wrap) fail(409, 'The sender hasn’t finished sending this yet. Try again in a minute.');
+  if (!l.recipient_wrap) fail(409, 'The sender hasn’t finished sending this yet. Try again in a minute.', undefined, 'not_ready');
   return [200, { ...view, forYou: true, hash: l.hash, meta: f.meta, senderKey: l.owner, recipientWrap: l.recipient_wrap }];
 }, { public: true });
 
 route('GET', /^\/v1\/s\/([\w-]+)\/blob$/, async (req, _o, [id], res) => {
   limit(req, 'link-blob', 120, 60_000);
   const l = liveLink(id);
-  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE);
+  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE, undefined, 'not_recipient');
   if (req.method === 'GET') {
     const f = S.files.get.get(l.owner, l.hash);
     const from = Number(/^bytes=(\d+)-/.exec(req.headers.range || '')?.[1] || 0);
@@ -602,16 +632,21 @@ route('GET', /^\/v1\/s\/([\w-]+)\/blob$/, async (req, _o, [id], res) => {
   await serveBlob(req, res, l.hash);
 }, { public: true, head: true, raw: true });
 
-// Anyone holding a link can report it, and it is switched off at once; the owner reviews reports by hand for now.
+// Anyone holding a link can report it. It is switched off at once and the file is put on legal hold (its owner can't
+// delete it) until an admin has reviewed the report and released it with scripts/legal-hold.mjs.
 route('POST', /^\/v1\/s\/([\w-]+)\/report$/, async (req, _o, [id]) => {
   limit(req, 'report', 10, 3600_000);
   const l = ID.test(id) && S.links.get.get(id);
   if (!l) fail(404, 'No such link.');
   // Only the recipient can see what a bound link holds, so only they can report it (and nobody else can switch it off).
-  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE);
+  if (l.recipient && !(await asRecipient(req, l))) fail(403, SOMEONE_ELSE, undefined, 'not_recipient');
   const { reason } = await readJson(req, 4096);
-  S.reports.add.run(id, now(), String(reason || '').slice(0, 500), ip(req));
-  console.warn(`[bdrivex] link ${id} reported and switched off (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…)`);
+  const t = now();
+  const fresh = S.reports.add.run(id, t, String(reason || '').slice(0, 500), ip(req), l.owner, l.hash).changes > 0;
+  if (fresh && !S.holds.active.get(l.owner, l.hash)) S.holds.place.run(l.owner, l.hash, id, t, 'report');
+  // Notification: bdrivex-api has no mail sender, so this line in the pm2 log is the notice. Grep for "REPORT".
+  // TODO: send this to support@bwalletx.com once there is a mail or notify service on the server (not added here).
+  if (fresh) console.warn(`[bdrivex] REPORT link ${id} switched off, file held (owner ${l.owner.slice(0, 12)}…, file ${l.hash.slice(0, 12)}…, ${new Date(t).toISOString()}). For ${SUPPORT}: review with scripts/legal-hold.mjs list`);
   return [204, null];
 }, { public: true });
 
@@ -647,7 +682,8 @@ const server = createServer(async (req, res) => {
     if (res.headersSent) return res.destroy();
     if (!(e instanceof HttpError)) console.error('[bdrivex]', req.method, path, e);
     const status = e instanceof HttpError ? e.status : 500;
-    const body = !(e instanceof HttpError) ? { error: 'Something went wrong on our side.' } : e.code ? { error: e.code, message: e.message } : { error: e.message };
+    const body = !(e instanceof HttpError) ? { error: 'Something went wrong on our side.', code: 'server_error' }
+      : e.code ? { error: CODE_IN_ERROR.has(e.code) ? e.code : e.message, code: e.code, message: e.message } : { error: e.message };
     send(res, status, body, e.headers);
     if (status !== 500) req.resume();
   }
@@ -656,6 +692,25 @@ server.requestTimeout = 0; // big chunks on slow links; headersTimeout still app
 server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · blobs ${blobs.describe()} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
 
 setInterval(() => retryBlobDeletes().catch((e) => console.error('[bdrivex] blob delete retry', e)), BLOB_DELETE_RETRY_MS).unref();
+
+// Retention, in process like the retry above (one process: see oneAtATime). Report records older than
+// REPORT_KEEP_DAYS go (the records outlive their links and files until then), reporter IPs older than
+// REPORT_IP_HASH_DAYS become a keyed hash, released holds older than REPORT_KEEP_DAYS go, links revoked or expired more
+// than LINK_SCRUB_DAYS ago lose recipient key, wrap and label (not while their file is held), and closed-account
+// entries go once every token they block has expired.
+function housekeeping() {
+  const t = now();
+  const reports = Number(S.reports.expire.run(t - REPORT_KEEP_MS).changes);
+  let ips = 0;
+  for (const r of S.reports.rawIps.all(t - REPORT_IP_HASH_MS)) { S.reports.setIp.run(hashIp(SECRET, r.ip), r.link_id); ips++; }
+  const holds = Number(S.holds.expire.run(t - REPORT_KEEP_MS).changes);
+  const links = Number(S.links.scrub.run(t, t - LINK_SCRUB_MS).changes);
+  const closed = Number(S.closed.purge.run(t).changes);
+  if (reports || ips || holds || links || closed) console.log(`[bdrivex] retention: ${reports} old reports deleted, ${ips} reporter IPs hashed, ${holds} old released holds deleted, ${links} links scrubbed, ${closed} closed-account entries purged`);
+}
+const runHousekeeping = () => { try { housekeeping(); } catch (e) { console.error('[bdrivex] retention', e); } };
+setTimeout(runHousekeeping, Math.min(HOUSEKEEPING_MS, 60_000)).unref();
+setInterval(runHousekeeping, HOUSEKEEPING_MS).unref();
 
 // Abandoned uploads (no chunk for 2 days) are cleared out hourly.
 setInterval(async () => {

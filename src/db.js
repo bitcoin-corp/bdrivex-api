@@ -37,6 +37,17 @@ export function openDb(file) {
     -- Uploading the same bytes again removes the row. b2_pruned_at: when the mirror removed it from B2 (audit).
     CREATE TABLE IF NOT EXISTS erased_blobs (
       hash TEXT PRIMARY KEY, erased_at INTEGER NOT NULL, reason TEXT NOT NULL, b2_pruned_at INTEGER);
+    -- Legal holds: a reported file (owner, hash) can't be deleted by its owner, or by scripts/close-account.mjs, until
+    -- an admin releases the hold with scripts/legal-hold.mjs. A report places one; an admin can place one by hand.
+    -- Released holds are kept for the report retention period (3 years after release), then deleted.
+    CREATE TABLE IF NOT EXISTS holds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, hash TEXT NOT NULL, link_id TEXT,
+      placed_at INTEGER NOT NULL, reason TEXT, released_at INTEGER, released_note TEXT);
+    CREATE INDEX IF NOT EXISTS holds_file ON holds(owner, hash);
+    -- Accounts closed by scripts/close-account.mjs: sha256 of the identity key (never the key itself), so tokens
+    -- issued before closing stop working. Deleted once every such token has expired (purge_after).
+    CREATE TABLE IF NOT EXISTS closed_accounts (
+      key_hash TEXT PRIMARY KEY, closed_at INTEGER NOT NULL, purge_after INTEGER NOT NULL);
   `);
   // v1.1: the file key wrapped by the owner's wallet (BRC-2, counterparty self). Only that wallet can open it.
   if (!db.prepare('PRAGMA table_info(files)').all().some((c) => c.name === 'key_wrap')) db.exec('ALTER TABLE files ADD COLUMN key_wrap TEXT');
@@ -46,6 +57,20 @@ export function openDb(file) {
   const linkCols = new Set(db.prepare('PRAGMA table_info(links)').all().map((c) => c.name));
   for (const c of ['recipient', 'recipient_wrap', 'recipient_label']) if (!linkCols.has(c)) db.exec(`ALTER TABLE links ADD COLUMN ${c} TEXT`);
   db.exec('CREATE INDEX IF NOT EXISTS links_recipient ON links(recipient)');
+  // Revoked or expired links lose recipient, recipient_wrap and recipient_label after a grace period (the terms promise
+  // it); recipient_scrubbed_at says when, so the owner's list still shows it was sent to one person.
+  if (!linkCols.has('recipient_scrubbed_at')) db.exec('ALTER TABLE links ADD COLUMN recipient_scrubbed_at INTEGER');
+  // Reports keep what was reported (owner, hash) so the record outlives the link and the file (a deleted file takes its
+  // links with it). Reports made before this column existed are filled in from their links, and their files held.
+  const reportCols = new Set(db.prepare('PRAGMA table_info(reports)').all().map((c) => c.name));
+  if (!reportCols.has('owner')) {
+    db.exec(`ALTER TABLE reports ADD COLUMN owner TEXT; ALTER TABLE reports ADD COLUMN hash TEXT;
+      UPDATE reports SET owner = (SELECT owner FROM links WHERE id = reports.link_id), hash = (SELECT hash FROM links WHERE id = reports.link_id);
+      INSERT INTO holds (owner, hash, link_id, placed_at, reason)
+        SELECT r.owner, r.hash, r.link_id, r.at, 'report (from before holds existed)' FROM reports r
+        WHERE r.owner IS NOT NULL AND EXISTS (SELECT 1 FROM files f WHERE f.owner = r.owner AND f.hash = r.hash)
+          AND NOT EXISTS (SELECT 1 FROM holds h WHERE h.link_id = r.link_id);`);
+  }
   const q = (sql) => db.prepare(sql);
   return {
     db,
@@ -80,6 +105,12 @@ export function openDb(file) {
       forFile: q('SELECT * FROM links WHERE owner = ? AND hash = ? ORDER BY created_at DESC'),
       revoke: q('UPDATE links SET revoked_at = ? WHERE id = ? AND owner = ? AND revoked_at IS NULL'),
       hit: q('UPDATE links SET downloads = downloads + 1 WHERE id = ?'),
+      // Revoked or expired before ?2: drop who it was for. Not while the file is on legal hold (the report is about
+      // what was sent to whom); once the hold is released, the next run scrubs it.
+      scrub: q(`UPDATE links SET recipient = NULL, recipient_wrap = NULL, recipient_label = NULL, recipient_scrubbed_at = ?1
+        WHERE (recipient IS NOT NULL OR recipient_wrap IS NOT NULL OR recipient_label IS NOT NULL)
+          AND ((revoked_at IS NOT NULL AND revoked_at < ?2) OR (expires_at IS NOT NULL AND expires_at < ?2))
+          AND NOT EXISTS (SELECT 1 FROM holds h WHERE h.owner = links.owner AND h.hash = links.hash AND h.released_at IS NULL)`),
     },
     blobDeletes: {
       failed: q(`INSERT INTO blob_deletes (hash, first_failed_at, last_failed_at, attempts, error) VALUES (?1, ?2, ?2, 1, ?3)
@@ -95,8 +126,22 @@ export function openDb(file) {
       clear: q('DELETE FROM erased_blobs WHERE hash = ?'),
     },
     reports: {
-      add: q('INSERT OR IGNORE INTO reports (link_id, at, reason, ip) VALUES (?, ?, ?, ?)'),
+      add: q('INSERT OR IGNORE INTO reports (link_id, at, reason, ip, owner, hash) VALUES (?, ?, ?, ?, ?, ?)'),
       get: q('SELECT at, reason FROM reports WHERE link_id = ?'),
+      // Retention: records older than the cut-off go; reporter IPs older than the other cut-off are replaced by a keyed
+      // hash ('h:<hex>'), so repeat reporters can still be matched but the address itself is gone.
+      expire: q('DELETE FROM reports WHERE at < ?'),
+      rawIps: q("SELECT link_id, ip FROM reports WHERE at < ? AND ip IS NOT NULL AND ip NOT LIKE 'h:%'"),
+      setIp: q('UPDATE reports SET ip = ? WHERE link_id = ?'),
+    },
+    holds: {
+      place: q('INSERT INTO holds (owner, hash, link_id, placed_at, reason) VALUES (?, ?, ?, ?, ?)'),
+      active: q('SELECT id, link_id, placed_at, reason FROM holds WHERE owner = ? AND hash = ? AND released_at IS NULL LIMIT 1'),
+      expire: q('DELETE FROM holds WHERE released_at IS NOT NULL AND released_at < ?'),
+    },
+    closed: {
+      get: q('SELECT closed_at FROM closed_accounts WHERE key_hash = ?'),
+      purge: q('DELETE FROM closed_accounts WHERE purge_after < ?'),
     },
     sessions: {
       revoke: q('INSERT OR IGNORE INTO revoked (sid, expires_at) VALUES (?, ?)'),
