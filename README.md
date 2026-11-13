@@ -8,11 +8,13 @@ pnpm install
 pnpm dev                          # http://127.0.0.1:8787, data in ./data, dev origins 127.0.0.1:5173, sign-up open
                                   # (sharing is invite-only unless .env.local has SHARING=open or your key in ALLOWED_KEYS)
 pnpm test [file]                  # end to end with the site's client code (sign in, upload, resume, link, download)
+pnpm test:s3                      # the S3 store, SigV4, migration and B2 mirror against a fake S3, then the e2e on it
 node scripts/dev-session.mjs      # a throwaway-key session for testing /send without a wallet
 ```
 
 Node 22.13+ (`node:sqlite`), no native dependencies. Metadata in `DATA_DIR/bdrivex.db`, blobs in
-`DATA_DIR/blobs/aa/bb/<sha256>`. Settings: `.env.example`.
+`DATA_DIR/blobs/aa/bb/<sha256>` or an S3-compatible bucket (see Blob stores). Settings: `.env.example`.
+The tests need the site's client code: set `SITE_DIR=/path/to/bdrivex-site` if it isn't at `../bdrivex-site`.
 
 ## Auth
 
@@ -69,6 +71,80 @@ should tell apart comes as `{error: "<code>", message: "<sentence>"}`: so far on
 1 GB stored per wallet (`QUOTA_BYTES`, more for named wallets via `QUOTA_OVERRIDES`), 2 GB per file, links up to 30
 days, 10 GB uploaded per wallet per day, 50 GB of link downloads per sender per day, and request limits per IP and per
 wallet on sign-in, uploads, link creation, downloads and reports.
+
+## Blob stores
+
+Blobs are opaque ciphertext named by the SHA-256 of their bytes, so identical uploads are stored once and a stored
+blob never changes. A file row points at a hash; a blob is deleted only when no file row holds it any more.
+
+- `BLOB_STORE=fs` (the default): `DATA_DIR/blobs/aa/bb/<sha256>` on the server's disk.
+- `BLOB_STORE=s3`: `<S3_PREFIX><sha256>` in any S3-compatible bucket (Hetzner Object Storage is the target; Backblaze
+  B2, MinIO and AWS work the same). Path-style URLs, AWS SigV4 signed with `node:crypto`, no extra dependencies.
+  `S3_ENDPOINT` (e.g. `https://fsn1.your-objectstorage.com`, no bucket in it), `S3_REGION` (`fsn1`), `S3_BUCKET`,
+  `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, optional `S3_PREFIX` (e.g. `blobs/`). The server won't start with
+  any of these missing.
+
+Uploads are staged in `DATA_DIR/tmp` either way (32 MB PATCH chunks; the server re-hashes on `/complete`). With s3,
+`/complete` then uploads the finished blob in one streamed PUT (files are at most 2 GB; S3's single-PUT limit is
+5 GB) signed with its SHA-256, so the bucket itself refuses bytes that don't match, and removes the staged file. If the
+bucket doesn't answer, `/complete` returns 503 with `Retry-After` and keeps the upload, so it can be finished again.
+`GET /v1/blobs/:sha256` and `/v1/s/:id/blob` check the size with HEAD and pass `Range` through to the bucket: the
+same 200/206/416 and `Content-Range` as the fs store. Mind the disk: a 2 GB upload still needs 2 GB in `tmp`.
+
+**Moving an existing server to s3** (`scripts/migrate-blobs-to-s3.mjs`; it copies, checks, and deletes nothing):
+
+```sh
+cd /srv/bdrivex/api
+node --env-file=/srv/bdrivex/.env scripts/migrate-blobs-to-s3.mjs --dry-run   # what it would upload
+node --env-file=/srv/bdrivex/.env scripts/migrate-blobs-to-s3.mjs             # copy; each copy HEAD-sized and re-hashed
+# set BLOB_STORE=s3 in the env, restart the API, then run the migration once more for blobs that came in meanwhile
+# keep DATA_DIR/blobs until downloads have been checked; remove it by hand later
+```
+
+It skips blobs already in the bucket at the right size (`--verify-existing` re-hashes those too), refuses a local
+file whose bytes don't match its name, reports file rows that have no blob anywhere, and exits 1 if any blob failed.
+
+**Second copy in Backblaze B2** (`scripts/mirror-to-b2.mjs`): lists the primary bucket and copies every object B2
+doesn't have, streaming bucket to bucket, signed with the blob's SHA-256. Content-addressed, so a key B2 already has at
+the same size is the same blob; a size mismatch is reported and left alone. v1 never deletes from B2, so files deleted
+here stay in B2 until pruned by hand. One summary line; exit 1 on any failure. Env: the `S3_*` above plus `B2_ENDPOINT`
+(e.g. `https://s3.eu-central-003.backblazeb2.com`), `B2_REGION` (`eu-central-003`), `B2_BUCKET`, `B2_ACCESS_KEY_ID`,
+`B2_SECRET_ACCESS_KEY`, optional `B2_PREFIX` (defaults to `S3_PREFIX`). `--dry-run` lists what it would copy.
+
+Nightly, as a systemd timer (an example: nothing installs it):
+
+```ini
+# /etc/systemd/system/bdrivex-mirror.service
+[Unit]
+Description=bDriveX: copy new blobs to Backblaze B2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bdrivex
+WorkingDirectory=/srv/bdrivex/api
+ExecStart=/usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs
+
+# /etc/systemd/system/bdrivex-mirror.timer
+[Unit]
+Description=bDriveX B2 mirror, nightly
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`systemctl enable --now bdrivex-mirror.timer`; results in `journalctl -u bdrivex-mirror`; a failed run shows in
+`systemctl --failed`. Or with cron:
+
+```cron
+15 3 * * * cd /srv/bdrivex/api && /usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs >> /var/log/bdrivex-mirror.log 2>&1
+```
 
 ## BDX1 sealed format (for other clients)
 
