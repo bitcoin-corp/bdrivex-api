@@ -156,7 +156,7 @@ remote_prepare_stage() {
 
 # Interactive (ssh -t): ask for the two keys with hidden input and write the S3 settings into the env file.
 remote_set_keys() {
-  local file=$1 ak='' sk='' tries=0 has_ak has_sk answer
+  local file=$1 ak='' sk='' tries=0 has_ak has_sk answer keyre='^[A-Za-z0-9._/+=-]{8,255}$'
   [ -t 0 ] || { say "set-keys needs a terminal (ssh -t)"; return 1; }
   has_ak=$(grep -cE '^(export )?S3_ACCESS_KEY_ID=.+' "$file" || true)
   has_sk=$(grep -cE '^(export )?S3_SECRET_ACCESS_KEY=.+' "$file" || true)
@@ -173,8 +173,8 @@ remote_set_keys() {
     tries=$((tries + 1))
     IFS= read -r -s -p "S3_ACCESS_KEY_ID: " ak; printf '\n'
     IFS= read -r -s -p "S3_SECRET_ACCESS_KEY: " sk; printf '\n'
-    if [[ "$ak" =~ ^[A-Za-z0-9._/+=-]{8,256}$ ]] && [[ "$sk" =~ ^[A-Za-z0-9._/+=-]{8,256}$ ]]; then break; fi
-    say "That doesn't look like a key pair (letters, digits and ._/+=- only, 8 to 256 characters). Not shown."
+    if [[ "$ak" =~ $keyre ]] && [[ "$sk" =~ $keyre ]]; then break; fi
+    say "That doesn't look like a key pair (letters, digits and ._/+=- only, 8 to 255 characters). Not shown."
     [ "$tries" -lt 3 ] || { ak=''; sk=''; say "giving up after 3 tries; nothing written"; return 1; }
   done
   write_env "$file" S3_ENDPOINT "$S3_ENDPOINT_VALUE" S3_REGION "$S3_REGION_VALUE" S3_BUCKET "$S3_BUCKET_VALUE" S3_PREFIX "$S3_PREFIX_VALUE" \
