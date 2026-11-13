@@ -96,10 +96,20 @@ blob and recording its file row, and deleting a row and then the blob if nobody 
 by an in-process lock. Two processes would not see each other's lock, and a delete in one could remove a blob that an
 upload in the other has just found already stored. (The rate limits and the upload `busy` set are per process too.)
 
+**The deletion log.** When a user's delete removes the last file row for a blob, the server writes
+`erased_blobs(hash, erased_at, reason, b2_pruned_at)` in the same step as the store delete, whether that delete
+succeeds or is left to the retry. Uploading the same bytes again removes the row, so a blob that is live again is never
+pruned from the backup. This log is the only thing the B2 mirror deletes by (see below).
+
 **Failed deletes.** When the last file row for a blob goes, the user's delete succeeds even if the bucket refuses the
 blob delete. The blob is recorded in the `blob_deletes` table and the server tries again every 10 minutes
-(`BLOB_DELETE_RETRY_MS`), first checking that nobody holds the blob again. `scripts/orphan-blobs.mjs` compares the
-bucket with the database:
+(`BLOB_DELETE_RETRY_MS`), first checking that nobody holds the blob again.
+
+**Orphans.** `scripts/orphan-blobs.mjs` compares the bucket with the database. With `--delete` it is **the only path
+that deletes from the primary without a user's action**, a deliberate operator tool. It never touches B2 and writes
+no deletion-log rows, so whatever it removes stays in the B2 backup. The mirror reports those copies as "unreferenced"
+and never prunes them. (An orphan left by a user's failed delete already has its log row, so once it is gone from the
+primary, the mirror prunes it like any other user delete.)
 
 ```sh
 node --env-file=/srv/bdrivex/.env scripts/orphan-blobs.mjs            # report: orphans, rows with no blob, failed deletes
@@ -131,21 +141,40 @@ the same size is the same blob; a size mismatch is reported and left alone. Env:
 (e.g. `https://s3.eu-central-003.backblazeb2.com`), `B2_REGION` (`eu-central-003`), `B2_BUCKET`, `B2_ACCESS_KEY_ID`,
 `B2_SECRET_ACCESS_KEY`, optional `B2_PREFIX` (defaults to `S3_PREFIX`).
 
-With `--prune` it also deletes from B2 every blob the primary no longer has, so a deleted or erased file leaves the
-backup within a day. It logs every key it deletes, and it refuses, deleting nothing, if:
+With `--prune` it also deletes from B2 the blobs users deliberately deleted, and nothing else. A blob is pruned
+only if it is in the deletion log, not yet pruned, gone from the primary, and held by no file row (checked again just
+before each delete). It is then marked `b2_pruned_at`, so each erasure is pruned once and can be audited, and the
+key, erasure time and reason are logged. **It never deletes a blob just because the primary lacks it.** A loss on the
+primary side (a bad migration, a bucket mishap) leaves the backup alone. It needs the API database
+(`DATA_DIR/bdrivex.db`), which it opens read-only except to write `b2_pruned_at`. It refuses, deleting nothing, if:
 
 - either listing failed or came back cut short (truncated with no continuation token);
-- the primary listing is empty (a wrong bucket, prefix or key looks exactly like that), even with `--force`;
+- the primary listing is empty while the database has file rows (a wrong bucket, prefix or key);
 - it would delete more than 10% of B2's blobs and more than 25 objects (`--max-delete-share`, `--max-delete-floor`),
-  unless `--force`.
+  unless `--force`;
+- the database is missing, or predates the deletion log (exit 2).
 
-A refused prune exits 1. Only keys ending in a sha256 are ever pruned. `--dry-run` copies and deletes nothing and
-prints what it would do. One summary line, plus a line per key deleted; exit 1 on any failure.
+A refused prune exits 1. A blob erased while the primary still has it (its delete is being retried) waits for a
+later run. `--dry-run` copies and deletes nothing and prints what it would do. One summary line, plus a line per key
+deleted; exit 1 on any failure.
 
 The nightly timer runs with `--prune`: erasure requests and the privacy policy need deletions to reach the backup, and
-a prune that has to be remembered by hand won't happen. The flag stays off by default in the script, so a one-off run
-by hand never deletes. The guards above stop a misconfigured run from emptying B2, and the worst a wrong prune can do
-is drop backup copies of blobs the primary still holds; the next run copies them back.
+a prune someone has to remember to run won't happen. Since it deletes only what the deletion log names, a primary-side
+mistake can't spread to the backup.
+
+**Lost blobs and restoring them.** Every run also counts B2 blobs the primary lacks: *lost* (a file row still needs
+it), *erased* (in the deletion log, not pruned yet) or *unreferenced* (no row and no log entry, e.g. removed with
+`orphan-blobs --delete`). A lost blob makes the nightly run exit 1, so it shows as a failed run.
+
+```sh
+node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs --restorable         # list them; copies and deletes nothing
+node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs --restore --dry-run  # what it would copy back
+node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs --restore            # copy the lost ones back from B2
+```
+
+`--restore` copies only *lost* blobs back to the primary, signed with their SHA-256 (so a damaged B2 copy is
+refused), and never erased ones. Unreferenced blobs aren't needed by any file; if one must come back, copy it by hand
+from `B2_BUCKET/<B2_PREFIX><sha256>` to `S3_BUCKET/<S3_PREFIX><sha256>`.
 
 **B2 keeps old versions by default.** A delete through the S3 API only hides the file. For deletions to be real,
 set the bucket's lifecycle to "Keep only the last version of the file" (or a rule with `daysFromHidingToDeleting: 1`).
@@ -156,7 +185,7 @@ Nightly, as a systemd timer (an example: nothing installs it):
 ```ini
 # /etc/systemd/system/bdrivex-mirror.service
 [Unit]
-Description=bDriveX: copy new blobs to Backblaze B2 and remove deleted ones
+Description=bDriveX: copy new blobs to Backblaze B2 and prune user-deleted ones (deletion log)
 After=network-online.target
 Wants=network-online.target
 
@@ -180,7 +209,8 @@ WantedBy=timers.target
 ```
 
 `systemctl enable --now bdrivex-mirror.timer`; results in `journalctl -u bdrivex-mirror`; a failed run shows in
-`systemctl --failed` (a refused prune counts as failed, so someone looks). Before enabling it, run it once by hand
+`systemctl --failed` (a refused prune or a lost blob counts as failed, so someone looks). The env file must set
+`DATA_DIR`, and the service user must be able to write the database (for `b2_pruned_at`), so run it as the API's user. Before enabling it, run it once by hand
 with `--prune --dry-run` and read what it would delete. Or with cron:
 
 ```cron
