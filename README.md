@@ -8,7 +8,7 @@ pnpm install
 pnpm dev                          # http://127.0.0.1:8787, data in ./data, dev origins 127.0.0.1:5173, sign-up open
                                   # (sharing is invite-only unless .env.local has SHARING=open or your key in ALLOWED_KEYS)
 pnpm test [file]                  # end to end with the site's client code (sign in, upload, resume, link, download)
-pnpm test:s3                      # the S3 store, SigV4, migration and B2 mirror against a fake S3, then the e2e on it
+pnpm test:s3                      # S3 store, SigV4, migration, B2 mirror, orphans against a fake S3, then the e2e on it
 node scripts/dev-session.mjs      # a throwaway-key session for testing /send without a wallet
 ```
 
@@ -91,6 +91,27 @@ bucket doesn't answer, `/complete` returns 503 with `Retry-After` and keeps the 
 `GET /v1/blobs/:sha256` and `/v1/s/:id/blob` check the size with HEAD and pass `Range` through to the bucket: the
 same 200/206/416 and `Content-Range` as the fs store. Mind the disk: a 2 GB upload still needs 2 GB in `tmp`.
 
+**Run the API as one process: pm2 fork mode (`exec_mode: 'fork'`, `instances: 1`), never cluster mode.** Storing a
+blob and recording its file row, and deleting a row and then the blob if nobody else holds it, are serialised per hash
+by an in-process lock. Two processes would not see each other's lock, and a delete in one could remove a blob that an
+upload in the other has just found already stored. (The rate limits and the upload `busy` set are per process too.)
+
+**Failed deletes.** When the last file row for a blob goes, the user's delete succeeds even if the bucket refuses the
+blob delete. The blob is recorded in the `blob_deletes` table and the server tries again every 10 minutes
+(`BLOB_DELETE_RETRY_MS`), first checking that nobody holds the blob again. `scripts/orphan-blobs.mjs` compares the
+bucket with the database:
+
+```sh
+node --env-file=/srv/bdrivex/.env scripts/orphan-blobs.mjs            # report: orphans, rows with no blob, failed deletes
+node --env-file=/srv/bdrivex/.env scripts/orphan-blobs.mjs --delete   # delete the orphans it reports
+```
+
+Reporting is the default; it deletes only with `--delete`. Blobs younger than `--min-age-hours` (24) are never
+orphans, since an upload stores its blob just before its row. Only `<S3_PREFIX><sha256>` keys are touched. `--delete`
+refuses if the database has no file rows but the bucket has blobs (a wrong `DATA_DIR`), or if it would delete more than
+10% of the bucket's blobs and more than 25 objects, unless `--force`. It checks each orphan's rows again just before
+deleting it, but it shares no lock with the server, so run `--delete` while the API is quiet.
+
 **Moving an existing server to s3** (`scripts/migrate-blobs-to-s3.mjs`; it copies, checks, and deletes nothing):
 
 ```sh
@@ -106,17 +127,36 @@ file whose bytes don't match its name, reports file rows that have no blob anywh
 
 **Second copy in Backblaze B2** (`scripts/mirror-to-b2.mjs`): lists the primary bucket and copies every object B2
 doesn't have, streaming bucket to bucket, signed with the blob's SHA-256. Content-addressed, so a key B2 already has at
-the same size is the same blob; a size mismatch is reported and left alone. v1 never deletes from B2, so files deleted
-here stay in B2 until pruned by hand. One summary line; exit 1 on any failure. Env: the `S3_*` above plus `B2_ENDPOINT`
+the same size is the same blob; a size mismatch is reported and left alone. Env: the `S3_*` above plus `B2_ENDPOINT`
 (e.g. `https://s3.eu-central-003.backblazeb2.com`), `B2_REGION` (`eu-central-003`), `B2_BUCKET`, `B2_ACCESS_KEY_ID`,
-`B2_SECRET_ACCESS_KEY`, optional `B2_PREFIX` (defaults to `S3_PREFIX`). `--dry-run` lists what it would copy.
+`B2_SECRET_ACCESS_KEY`, optional `B2_PREFIX` (defaults to `S3_PREFIX`).
+
+With `--prune` it also deletes from B2 every blob the primary no longer has, so a deleted or erased file leaves the
+backup within a day. It logs every key it deletes, and it refuses, deleting nothing, if:
+
+- either listing failed or came back cut short (truncated with no continuation token);
+- the primary listing is empty (a wrong bucket, prefix or key looks exactly like that), even with `--force`;
+- it would delete more than 10% of B2's blobs and more than 25 objects (`--max-delete-share`, `--max-delete-floor`),
+  unless `--force`.
+
+A refused prune exits 1. Only keys ending in a sha256 are ever pruned. `--dry-run` copies and deletes nothing and
+prints what it would do. One summary line, plus a line per key deleted; exit 1 on any failure.
+
+The nightly timer runs with `--prune`: erasure requests and the privacy policy need deletions to reach the backup, and
+a prune that has to be remembered by hand won't happen. The flag stays off by default in the script, so a one-off run
+by hand never deletes. The guards above stop a misconfigured run from emptying B2, and the worst a wrong prune can do
+is drop backup copies of blobs the primary still holds; the next run copies them back.
+
+**B2 keeps old versions by default.** A delete through the S3 API only hides the file. For deletions to be real,
+set the bucket's lifecycle to "Keep only the last version of the file" (or a rule with `daysFromHidingToDeleting: 1`).
+Hetzner Object Storage has versioning off unless you turn it on.
 
 Nightly, as a systemd timer (an example: nothing installs it):
 
 ```ini
 # /etc/systemd/system/bdrivex-mirror.service
 [Unit]
-Description=bDriveX: copy new blobs to Backblaze B2
+Description=bDriveX: copy new blobs to Backblaze B2 and remove deleted ones
 After=network-online.target
 Wants=network-online.target
 
@@ -124,7 +164,7 @@ Wants=network-online.target
 Type=oneshot
 User=bdrivex
 WorkingDirectory=/srv/bdrivex/api
-ExecStart=/usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs
+ExecStart=/usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs --prune
 
 # /etc/systemd/system/bdrivex-mirror.timer
 [Unit]
@@ -140,10 +180,11 @@ WantedBy=timers.target
 ```
 
 `systemctl enable --now bdrivex-mirror.timer`; results in `journalctl -u bdrivex-mirror`; a failed run shows in
-`systemctl --failed`. Or with cron:
+`systemctl --failed` (a refused prune counts as failed, so someone looks). Before enabling it, run it once by hand
+with `--prune --dry-run` and read what it would delete. Or with cron:
 
 ```cron
-15 3 * * * cd /srv/bdrivex/api && /usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs >> /var/log/bdrivex-mirror.log 2>&1
+15 3 * * * cd /srv/bdrivex/api && /usr/bin/node --env-file=/srv/bdrivex/.env scripts/mirror-to-b2.mjs --prune >> /var/log/bdrivex-mirror.log 2>&1
 ```
 
 ## BDX1 sealed format (for other clients)
