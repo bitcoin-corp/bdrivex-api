@@ -1,9 +1,10 @@
 // End to end against a real server on a temp data dir, with the site's own client code:
 // sign in (throwaway key) -> upload -> link -> download as a stranger -> same SHA-256. Plus the failure cases.
 //   pnpm test [file]      (default: the APK for Jon if it's on the Desktop, else 24 MB of random bytes)
+//   BLOB_STORE=s3 pnpm test   the same, with every server storing blobs in a fake S3 bucket run in this process
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, openSync, readSync, readFileSync, writeFileSync, statSync, rmSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, openSync, readSync, readFileSync, writeFileSync, statSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,16 +16,28 @@ const { uploadFile, openLink, downloadLink, shareUrl, parseShare, api, saveKeyWr
 const { newSeal, sealSegment, sealMeta, importKey, b64u } = await import(join(SITE, 'js/bdx-crypto.js'));
 const { parseRecipient } = await import(join(SITE, 'js/paymail.js'));
 const { DatabaseSync } = await import('node:sqlite');
+const { startFakeS3 } = await import('./fake-s3.mjs');
+
+// Where blobs go: the fs store (default) or, with BLOB_STORE=s3, a fake S3 bucket here, one prefix per server's data dir.
+const S3 = process.env.BLOB_STORE === 's3';
+const s3root = S3 ? mkdtempSync(join(tmpdir(), 'bdrivex-fake-s3-')) : null;
+const s3fake = S3 ? await startFakeS3({ root: s3root, region: 'fsn1', credentials: { 'test-key-id': 'test-secret' }, buckets: ['bdrivex'] }) : null;
+const storeEnv = (dir) => S3
+  ? { BLOB_STORE: 's3', S3_ENDPOINT: s3fake.endpoint, S3_REGION: 'fsn1', S3_BUCKET: 'bdrivex', S3_ACCESS_KEY_ID: 'test-key-id', S3_SECRET_ACCESS_KEY: 'test-secret', S3_PREFIX: `${basename(dir)}/` }
+  : { BLOB_STORE: 'fs' };
+const blobFile = (dir, h) => S3 ? s3fake.objectPath('bdrivex', `${basename(dir)}/${h}`) : join(dir, 'blobs', h.slice(0, 2), h.slice(2, 4), h);
+const placeBlob = (dir, h, buf) => { mkdirSync(dirname(blobFile(dir, h)), { recursive: true }); writeFileSync(blobFile(dir, h), buf); };
+console.log(`blob store: ${S3 ? `s3 (fake, ${s3fake.endpoint})` : 'fs'}`);
 
 const PORT = 8799, BASE = `http://127.0.0.1:${PORT}`, ORIGIN = 'http://127.0.0.1:5173';
 const wallet = new ProtoWallet(PrivateKey.fromRandom());
 const { publicKey: identityKey } = await wallet.getPublicKey({ identityKey: true });
 const data = mkdtempSync(join(tmpdir(), 'bdrivex-test-'));
 const srv = spawn(process.execPath, [join(here, '../src/server.js')], {
-  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', SHARING: 'open', QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
+  env: { ...process.env, PORT: String(PORT), DATA_DIR: data, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), SIGNUP: 'open', SHARING: 'open', ...storeEnv(data), QUOTA_BYTES: String(100 * 2 ** 20), QUOTA_OVERRIDES: `${identityKey}:${200 * 2 ** 20}` },
   stdio: ['ignore', 'inherit', 'inherit'],
 });
-const stop = () => { srv.kill(); rmSync(data, { recursive: true, force: true }); };
+const stop = () => { srv.kill(); rmSync(data, { recursive: true, force: true }); if (s3root) rmSync(s3root, { recursive: true, force: true }); };
 process.on('exit', stop);
 for (let i = 0; ; i++) { try { await fetch(BASE + '/health'); break; } catch { if (i > 50) throw new Error('server did not start'); await new Promise((r) => setTimeout(r, 100)); } }
 
@@ -89,9 +102,9 @@ const t0 = Date.now();
 const up = await uploadFile({ base: BASE, token: T2, source, name: basename(path), type: 'application/vnd.android.package-archive', resume: saved });
 ok(HASH(up.hash) && up.key.length === 43, `resumed and completed in ${Date.now() - t0} ms · blob ${up.hash.slice(0, 16)}…`);
 function HASH(h) { return /^[0-9a-f]{64}$/.test(h); }
-const onDisk = readFileSync(join(data, 'blobs', up.hash.slice(0, 2), up.hash.slice(2, 4), up.hash));
-ok(sha(onDisk) === up.hash, 'blob on disk is stored under the sha256 of its bytes');
-ok(!onDisk.includes(readFileSync(path).subarray(4096, 4160)), 'blob on disk does not contain the plaintext');
+const onDisk = readFileSync(blobFile(data, up.hash));
+ok(sha(onDisk) === up.hash, `stored blob (${S3 ? 'in the bucket' : 'on disk'}) is under the sha256 of its bytes`);
+ok(!onDisk.includes(readFileSync(path).subarray(4096, 4160)), 'the stored blob does not contain the plaintext');
 ok(!onDisk.includes(Buffer.from(basename(path))), 'nor the file name');
 
 // ---- link and download as someone with no wallet
@@ -126,7 +139,7 @@ ok(cut && got2.sha256 === want, 'download picked up again after a dropped connec
 await rejects(openLink({ base: BASE, id: link.id, key: 'A'.repeat(43) }), /key/i, 'wrong key is caught');
 
 // ---- tampering: flip a byte in the stored blob
-const blob = join(data, 'blobs', up.hash.slice(0, 2), up.hash.slice(2, 4), up.hash);
+const blob = blobFile(data, up.hash);
 const orig = readFileSync(blob);
 const evil = Buffer.from(orig); evil[orig.length >> 1] ^= 1; writeFileSync(blob, evil);
 await rejects(downloadLink({ base: BASE, id: link.id, link: info, sink: { write() {} } }), /decrypt/i, 'a changed byte on the server is caught');
@@ -180,6 +193,27 @@ ok(put.status === 201, 'PUT /v1/blobs/:sha256 stores a small blob');
 await rejects(api(BASE, T2).call('PUT', `/v1/blobs/${'1'.repeat(64)}`, { body: photo }), /^422/, 'PUT with a body that does not match its hash is refused');
 const back = Buffer.from(await (await api(BASE, T2).call('GET', `/v1/blobs/${ph}`, { headers: { range: 'bytes=100-199' } })).arrayBuffer());
 ok(back.equals(photo.subarray(100, 200)), 'GET /v1/blobs/:sha256 serves Range reads to the owner');
+{
+  // Range details, the same whichever store is behind it
+  const g = (range, method = 'GET') => fetch(`${BASE}/v1/blobs/${ph}`, { method, headers: { authorization: `Bearer ${T2}`, ...(range ? { range } : {}) } });
+  const n = photo.length;
+  let r = await g('bytes=100-199');
+  ok(r.status === 206 && r.headers.get('content-range') === `bytes 100-199/${n}` && r.headers.get('content-length') === '100', 'a range: 206, Content-Range and Content-Length');
+  await r.arrayBuffer();
+  r = await g(`bytes=${n - 50}-`);
+  ok(r.status === 206 && Buffer.from(await r.arrayBuffer()).equals(photo.subarray(n - 50)) && r.headers.get('content-range') === `bytes ${n - 50}-${n - 1}/${n}`, 'an open-ended range');
+  r = await g('bytes=-10');
+  ok(r.status === 206 && Buffer.from(await r.arrayBuffer()).equals(photo.subarray(n - 10)), 'a suffix range (the last 10 bytes)');
+  r = await g(`bytes=${n - 5}-${n + 1000}`);
+  ok(r.status === 206 && r.headers.get('content-range') === `bytes ${n - 5}-${n - 1}/${n}` && (await r.arrayBuffer()).byteLength === 5, 'a range past the end is cut to the end');
+  r = await g(`bytes=${n}-`);
+  ok(r.status === 416 && r.headers.get('content-range') === `bytes */${n}`, 'a range starting past the end: 416, bytes */size');
+  await r.arrayBuffer();
+  r = await g(null);
+  ok(r.status === 200 && r.headers.get('accept-ranges') === 'bytes' && sha(Buffer.from(await r.arrayBuffer())) === ph, 'no range: 200, the whole blob, Accept-Ranges');
+  r = await g('bytes=0-9', 'HEAD');
+  ok(r.status === 206 && r.headers.get('content-length') === '10', 'HEAD with a range');
+}
 
 // ---- v1.1: the file key wrapped by the owner's wallet, kept beside the file
 console.log('wallet-wrapped keys');
@@ -203,11 +237,30 @@ await api(BASE, T2).del(`/v1/files/${up.hash}`);
 ok(!existsSync(blob), 'deleting a file removes its blob');
 await rejects(openLink({ base: BASE, id: short.id, key: up.key }), /^404/, 'and its links');
 ok(readdirSync(join(data, 'tmp')).length === 1, 'only the unfinished test upload is left in tmp');
+if (S3) {
+  ok(!existsSync(join(data, 'blobs')), 's3: no blob was ever written under DATA_DIR/blobs');
+  // the bucket is down when an upload finishes: 503, the upload and its staged bytes are kept, and finishing again works
+  const body = randomBytes(5000), bh = sha(body);
+  const u = await api(BASE, T2).post('/v1/uploads', { size: body.length });
+  await api(BASE, T2).call('PATCH', `/v1/uploads/${u.id}`, { body, headers: { 'content-type': 'application/offset+octet-stream', 'upload-offset': '0' } });
+  s3fake.failNext('PUT', 503, 3);
+  await rejects(api(BASE, T2).post(`/v1/uploads/${u.id}/complete`, { sha256: bh }), /^503 Storage is not answering/, 's3 down at /complete: 503');
+  ok((await api(BASE, T2).get(`/v1/uploads/${u.id}`)).offset === body.length && readdirSync(join(data, 'tmp')).includes(u.id), 'and the upload is kept, with its staged bytes');
+  const done = await api(BASE, T2).post(`/v1/uploads/${u.id}/complete`, { sha256: bh });
+  ok(done.hash === bh && readFileSync(blobFile(data, bh)).equals(body) && !readdirSync(join(data, 'tmp')).includes(u.id), 'finishing again uploads it to the bucket and clears the staged file');
+  // two wallets hold the same blob: deleting one copy keeps it, deleting the last removes it
+  const sp = await api(BASE, st.token).call('PUT', `/v1/blobs/${bh}`, { body });
+  ok(sp.status === 201 && (await api(BASE, st.token).get('/v1/files')).files.some((f) => f.hash === bh), 'a second wallet stores the same bytes (deduplicated)');
+  await api(BASE, T2).del(`/v1/files/${bh}`);
+  ok(existsSync(blobFile(data, bh)), 'deleting one holder keeps the blob in the bucket');
+  await api(BASE, st.token).del(`/v1/files/${bh}`);
+  ok(!existsSync(blobFile(data, bh)), 'deleting the last holder removes it from the bucket');
+}
 
 // ---- invite-only mode: a second server that admits only the test wallet (and a second invited wallet, O2)
 const startServer = async (port, dir, extra = {}) => {
   const p = spawn(process.execPath, [join(here, '../src/server.js')], {
-    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATA_DIR: dir, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ...extra },
+    env: { ...process.env, NODE_ENV: 'production', PORT: String(port), DATA_DIR: dir, ALLOWED_ORIGINS: ORIGIN, SESSION_SECRET: randomBytes(32).toString('hex'), ...storeEnv(dir), ...extra },
     stdio: ['ignore', 'ignore', 'inherit'],
   });
   for (let i = 0; ; i++) { try { await fetch(`http://127.0.0.1:${port}/health`); break; } catch { if (i > 50) throw new Error(`server on ${port} did not start`); await new Promise((r) => setTimeout(r, 100)); } }
@@ -441,9 +494,7 @@ const startServer = async (port, dir, extra = {}) => {
   const ck3 = await importKey(k3);
   const sealed = Buffer.concat([h3, await sealSegment(ck3, h3, 0, true, plain)]);
   const hh = sha(sealed);
-  const dir = join(d3, 'blobs', hh.slice(0, 2), hh.slice(2, 4));
-  (await import('node:fs')).mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, hh), sealed);
+  placeBlob(d3, hh, sealed);
   const lid = randomBytes(16).toString('base64url');
   old.prepare('INSERT INTO files (owner, hash, size, meta, created_at, key_wrap) VALUES (?, ?, ?, ?, ?, ?)').run(identityKey, hh, sealed.length, await sealMeta(ck3, h3, { name: 'old.bin', type: '', size: plain.length }), Date.now(), 'AAAA');
   old.prepare('INSERT INTO links (id, owner, hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(lid, identityKey, hh, Date.now(), Date.now() + 86400e3);
@@ -466,6 +517,8 @@ const startServer = async (port, dir, extra = {}) => {
   s3b.kill(); rmSync(d3, { recursive: true, force: true });
 }
 
+if (S3) ok(s3fake.requests.some((r) => r.method === 'GET' && r.range === 'bytes=100-199'), 's3: a Range read is passed through to the bucket as a Range request');
+if (S3) ok(s3fake.authFailures.length === 0 && s3fake.requests.length > 0, `s3: ${s3fake.requests.length} requests to the fake bucket, every SigV4 signature checked and good${s3fake.authFailures.length ? ': ' + s3fake.authFailures.join('; ') : ''}`);
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');
 stop();
 process.exit(failures ? 1 : 0);
