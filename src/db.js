@@ -26,6 +26,11 @@ export function openDb(file) {
     CREATE TABLE IF NOT EXISTS generations (owner TEXT PRIMARY KEY, gen INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS reports (
       link_id TEXT PRIMARY KEY, at INTEGER NOT NULL, reason TEXT, ip TEXT);
+    -- Blobs whose last file row went but whose delete from the store failed: retried by the server, and shown by
+    -- scripts/orphan-blobs.mjs. A row here never means the blob is wanted; the retry checks nobody holds it again.
+    CREATE TABLE IF NOT EXISTS blob_deletes (
+      hash TEXT PRIMARY KEY, first_failed_at INTEGER NOT NULL, last_failed_at INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 1, error TEXT);
   `);
   // v1.1: the file key wrapped by the owner's wallet (BRC-2, counterparty self). Only that wallet can open it.
   if (!db.prepare('PRAGMA table_info(files)').all().some((c) => c.name === 'key_wrap')) db.exec('ALTER TABLE files ADD COLUMN key_wrap TEXT');
@@ -69,6 +74,12 @@ export function openDb(file) {
       forFile: q('SELECT * FROM links WHERE owner = ? AND hash = ? ORDER BY created_at DESC'),
       revoke: q('UPDATE links SET revoked_at = ? WHERE id = ? AND owner = ? AND revoked_at IS NULL'),
       hit: q('UPDATE links SET downloads = downloads + 1 WHERE id = ?'),
+    },
+    blobDeletes: {
+      failed: q(`INSERT INTO blob_deletes (hash, first_failed_at, last_failed_at, attempts, error) VALUES (?1, ?2, ?2, 1, ?3)
+        ON CONFLICT(hash) DO UPDATE SET last_failed_at = ?2, attempts = attempts + 1, error = ?3`),
+      done: q('DELETE FROM blob_deletes WHERE hash = ?'),
+      all: q('SELECT hash, attempts FROM blob_deletes ORDER BY last_failed_at LIMIT 500'),
     },
     reports: {
       add: q('INSERT OR IGNORE INTO reports (link_id, at, reason, ip) VALUES (?, ?, ?, ?)'),

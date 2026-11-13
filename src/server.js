@@ -87,6 +87,8 @@ const ALLOWED_KEYS = new Set((env.ALLOWED_KEYS || '').split(',').map((s) => s.tr
 const SHARING = env.SHARING || 'invited';
 if (!['open', 'invited'].includes(SHARING)) throw new Error('SHARING must be open or invited.');
 const TRUST_PROXY = env.TRUST_PROXY === '1';
+// How often blob deletes that failed (store unreachable) are tried again. Default 10 minutes.
+const BLOB_DELETE_RETRY_MS = Number(env.BLOB_DELETE_RETRY_MS || 600_000);
 
 let SECRET = env.SESSION_SECRET || '';
 if (SECRET.length < 32) {
@@ -225,7 +227,8 @@ const sha256File = async (path) => {
 
 // One thing at a time per hash: storing a blob and recording its file row, or removing a row and then the blob if it
 // was the last. Without this, a delete could see no holders and remove a blob that a finishing upload has just
-// found already stored (a wider window with a network store). One process, so an in-memory queue is enough.
+// found already stored (a wider window with a network store). In memory, so it holds only while the API is ONE
+// process: run it in pm2 fork mode (instances: 1), never cluster mode.
 const hashQueues = new Map();
 async function oneAtATime(hash, fn) {
   const before = hashQueues.get(hash) ?? Promise.resolve();
@@ -243,10 +246,23 @@ async function store(tmp, hash) {
   catch (e) { console.error('[bdrivex] blob store put failed', hash.slice(0, 12), e.message); fail(503, STORE_DOWN, { 'retry-after': '60' }); }
 }
 
+/** Call inside oneAtATime(hash). Deletes the blob if no file row holds it; a failed delete is recorded and retried. */
 async function unlinkIfOrphan(hash) {
-  if (S.files.refs.get(hash).n !== 0) return;
-  // The file row is gone already; a blob left behind is ciphertext nobody can list, so log it for a sweep, don't fail.
-  try { await blobs.del(hash); } catch (e) { console.error(`[bdrivex] could not delete orphan blob ${hash}: ${e.message}`); }
+  if (S.files.refs.get(hash).n !== 0) { S.blobDeletes.done.run(hash); return; }
+  // The file row is gone already, so the user's delete has happened: don't fail it. Record the blob for the retry.
+  try { await blobs.del(hash); S.blobDeletes.done.run(hash); }
+  catch (e) {
+    S.blobDeletes.failed.run(hash, now(), String(e.message).slice(0, 300));
+    console.error(`[bdrivex] could not delete orphan blob ${hash} (will retry): ${e.message}`);
+  }
+}
+
+let retrying = false;
+async function retryBlobDeletes() {
+  if (retrying) return;
+  retrying = true;
+  try { for (const { hash } of S.blobDeletes.all.all()) await oneAtATime(hash, () => unlinkIfOrphan(hash)); }
+  finally { retrying = false; }
 }
 
 /** Stream a blob with Range support. Ciphertext only, never rendered by a browser. */
@@ -630,6 +646,8 @@ const server = createServer(async (req, res) => {
 });
 server.requestTimeout = 0; // big chunks on slow links; headersTimeout still applies
 server.listen(PORT, HOST, () => console.log(`[bdrivex] api on http://${HOST}:${PORT} · data ${DATA} · blobs ${blobs.describe()} · origins ${ORIGINS.join(' ')} · sign-up ${SIGNUP} · sharing ${SHARING}`));
+
+setInterval(() => retryBlobDeletes().catch((e) => console.error('[bdrivex] blob delete retry', e)), BLOB_DELETE_RETRY_MS).unref();
 
 // Abandoned uploads (no chunk for 2 days) are cleared out hourly.
 setInterval(async () => {
