@@ -15,7 +15,9 @@ Node 22.13+ (`node:sqlite`), no native dependencies. Metadata in `DATA_DIR/bdriv
 
 ## Auth
 
-1. `POST /v1/auth/challenge {identityKey}` with an `Origin` on `ALLOWED_ORIGINS` returns `{nonce, message, protocolID, keyID, expiresAt}`.
+1. `POST /v1/auth/challenge {identityKey?}` with an `Origin` on `ALLOWED_ORIGINS` returns `{nonce, message, protocolID, keyID, expiresAt}`.
+   `identityKey` is optional (connect 0.5.5+): without it the wallet can give the key and the signature in one sheet, and
+   step 3 binds the key claimed there; the signature must still be from exactly that key.
 2. The wallet signs `message`: `createSignature({protocolID, keyID, counterparty: 'anyone', data: utf8(message)})`.
    In a browser, `signInWithBwalletX` from `@bwalletx/connect` does steps 1 and 2.
 3. `POST /v1/auth/verify {identityKey, nonce, signature}` (same Origin) returns `{token, identityKey, expiresAt, scope}`.
@@ -31,7 +33,7 @@ A wallet that isn't admitted but is the recipient of a live link (v1.2) gets a *
 
 | Method | Path | Auth | Body / headers | Returns |
 |---|---|---|---|---|
-| POST | `/v1/auth/challenge` | Origin | `{identityKey}` | challenge |
+| POST | `/v1/auth/challenge` | Origin | `{identityKey?}` | challenge |
 | POST | `/v1/auth/verify` | Origin | `{identityKey, nonce, signature}` | `{token, identityKey, expiresAt}` |
 | POST | `/v1/auth/signout` | yes (also recipient) | | 204, this token stops working |
 | POST | `/v1/auth/signout-all` | yes (also recipient) | | 204, every token for this wallet stops working |

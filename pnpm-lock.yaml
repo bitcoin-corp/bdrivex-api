@@ -12,8 +12,8 @@ importers:
         specifier: 2.8.10
         version: 2.8.10
       '@bwalletx/connect':
-        specifier: 0.5.4
-        version: 0.5.4(@bsv/sdk@2.8.10)
+        specifier: 0.9.0
+        version: 0.9.0
     devDependencies:
       '@noble/hashes':
         specifier: 2.4.0
@@ -28,11 +28,14 @@ packages:
     resolution: {integrity: sha512-0KJxu772gbF2wKmD2dASciHYfAmo87ddXYknrMgYzGmI683l0trNcZHo0SYLWO5xZqJG5EB4ROyLuWXvhLCYFg==}
     engines: {node: '>=22'}
 
-  '@bwalletx/connect@0.5.4':
-    resolution: {integrity: sha512-fWqwX8wY0sSGSi27SeIyG2Y5Dbm+Cf78dDAfgINzpJpBNA05q+Eq87hBFwJvDqASc+A4ZU+4YQGOqd764NKm1w==}
-    engines: {node: '>=20'}
+  '@bsv/sdk@4.1.2':
+    resolution: {integrity: sha512-VBZ0Sl28gr1ZQ/bCAzqrBIHO03V56ATdeDwrKh/Rnu/mEgnNWkHeEtTOVe+JVOPbKcoRBurahmbYaH7Ta+RpbA==}
+    engines: {node: '>=22'}
+
+  '@bwalletx/connect@0.9.0':
+    resolution: {integrity: sha512-oDL9ZUfosvXywFN5hRRAw8Z9oHhNkh28sDdYgP6y0YtKQZ3iVcs/1B+rd7G85WsiPQ+EG3aDaCMEZbsJhNP1BA==}
+    engines: {node: '>=22'}
     peerDependencies:
-      '@bsv/sdk': '>=2.2.0 <4'
       next: '>=14'
       react: '>=18'
     peerDependenciesMeta:
@@ -213,9 +216,11 @@ snapshots:
 
   '@bsv/sdk@2.8.10': {}
 
-  '@bwalletx/connect@0.5.4(@bsv/sdk@2.8.10)':
+  '@bsv/sdk@4.1.2': {}
+
+  '@bwalletx/connect@0.9.0':
     dependencies:
-      '@bsv/sdk': 2.8.10
+      '@bsv/sdk': 4.1.2
       qrcode-generator: 1.5.2
 
   '@esbuild/aix-ppc64@0.28.2':

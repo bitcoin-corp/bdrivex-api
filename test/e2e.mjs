@@ -51,6 +51,16 @@ ok(bad.status === 403, 'challenge refused from an origin not on the list');
 const other = new ProtoWallet(PrivateKey.fromRandom());
 const forged = await signIn(other, identityKey);
 ok(forged.res.status === 401, 'a signature from a different key is refused');
+// connect 0.5.5+: the browser may ask for a challenge with no key (key and signature in one wallet sheet); verify then
+// binds the key claimed, and the signature must be from exactly that key.
+async function signInKeyless(w, key) {
+  const c = await (await post('/v1/auth/challenge', {})).json();
+  const { signature } = await w.createSignature({ protocolID: c.protocolID, keyID: c.keyID, counterparty: 'anyone', data: Array.from(new TextEncoder().encode(c.message)) });
+  return post('/v1/auth/verify', { identityKey: key, nonce: c.nonce, signature: Array.from(signature) });
+}
+const oneSheet = await signInKeyless(wallet, identityKey);
+ok(oneSheet.status === 200 && (await oneSheet.json()).identityKey === identityKey, 'a challenge made without a key signs in the key that signed it (one wallet sheet)');
+ok((await signInKeyless(other, identityKey)).status === 401, 'a keyless challenge refuses a signature from a key other than the one claimed');
 const T = session.token;
 await rejects(api(BASE).get('/v1/files'), /^401/, 'files need a session');
 const crossSite = await fetch(BASE + '/v1/files', { headers: { authorization: `Bearer ${T}`, origin: 'https://bphotosx.com' } });
